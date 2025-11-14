@@ -14,7 +14,7 @@
 
 // Project
 #include "sensors.h"
-#include "firebase.h"
+#include "hostinger_ingest.h"
 #include "Privado.h"
 
 // PPP
@@ -90,13 +90,9 @@ static void sensor_task(void *pv) {
 
     bool first_send = true;
 
-    if (firebase_init() != 0) {
-        ESP_LOGE(TAG_APP, "Error inicializando Firebase");
-        vTaskDelete(NULL);
-        return;
-    }
     vTaskDelay(pdMS_TO_TICKS(1000));
-    firebase_delete("/historial_mediciones");
+    // Replicar "delete on boot" ahora en SQL
+    hostinger_delete_all_for_device(DEVICE_ID);
 
     // 1 muestra/minuto, envío cada 5 min
     const int SAMPLE_EVERY_MIN = 1;
