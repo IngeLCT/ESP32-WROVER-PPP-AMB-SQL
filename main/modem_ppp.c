@@ -26,7 +26,7 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_timer.h"
-#include "privado.h"                // define UNWIREDLABS_TOKEN (tu archivo)
+#include "Privado.h"                // define UNWIREDLABS_TOKEN (tu archivo)
 
 /* Endpoint por defecto (cambia a EU si aplica) */
 #ifndef UNWIRED_URL
