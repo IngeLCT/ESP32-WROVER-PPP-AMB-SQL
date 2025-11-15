@@ -54,7 +54,7 @@ static int post_json(const char* url, const char* json_body) {
 }
 
 int hostinger_delete_all_for_device(const char* device_id) {
-    const char* url = "https://ambiente01.sensorwatts-energia.com/api/admin.php";
+    const char* url = HOSTINGER_URL_ADMIN;
     char body[256];
     snprintf(body, sizeof(body), "{\"op\":\"delete_all\",\"device_id\":\"%s\"}", device_id ? device_id : DEVICE_ID);
     int rc = post_json(url, body);
