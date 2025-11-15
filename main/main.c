@@ -4,10 +4,7 @@
 #include <stdint.h>
 #include <string.h>
 
-// FreeRTOS / ESP-IDF
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
+// ESP-IDF
 #include "nvs_flash.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -33,10 +30,13 @@ static esp_modem_dce_t *g_dce = NULL;
 // ---- Ciudad global para el JSON ----
 static char g_city[64]  = "----";
 
-#define LOG_EACH_SAMPLE 1
-#define SENSOR_TASK_STACK 10240
+#define LOG_EACH_SAMPLE        1
+#define SENSOR_TASK_STACK      10240
 
-// Opcional: helper (por ahora no lo usamos, pero no estorba)
+// Reintentos PPP (similar a WiFi)
+#define PPP_RECONNECT_WINDOW_MS  60000   // Intentar reconectar hasta 60 s
+#define PPP_BACKOFF_IDLE_MS      30000   // Si falla, esperar 30 s y volver a intentar
+
 static inline int64_t minutes_to_us(int m) { return (int64_t)m * 60 * 1000000; }
 
 // ----------------- WiFi hard off (libera netifs, etc.) -----------------
@@ -132,6 +132,21 @@ static void sensor_task(void *pv) {
     static uint32_t approx_count  = 0;
 
     while (1) {
+
+        // === Guard de PPP para sensado/envío ===
+        if (!modem_ppp_is_connected()) {
+            ESP_LOGW(TAG_APP, "PPP caído -> pauso medición/envío y reconecto");
+            bool ok = modem_ppp_reconnect_blocking(PPP_RECONNECT_WINDOW_MS);
+            if (!ok) {
+                ESP_LOGW(TAG_APP,
+                         "No se logró reconectar PPP, espero %d ms",
+                         PPP_BACKOFF_IDLE_MS);
+                vTaskDelay(pdMS_TO_TICKS(PPP_BACKOFF_IDLE_MS));
+                continue; // NO leer, NO acumular, NO enviar
+            }
+            ESP_LOGI(TAG_APP, "PPP reconectado; reanudo medición/envío");
+        }
+
         // Lectura de sensores
         if (sensors_read(&data) == ESP_OK) {
             sample_count++;
@@ -227,10 +242,12 @@ static void sensor_task(void *pv) {
             }
 
             int batch_minutes = SAMPLES_PER_BATCH * SAMPLE_EVERY_MIN;
+#if LOG_EACH_SAMPLE
             ESP_LOGI(TAG_APP, "JSON promedio %dm: %s", batch_minutes, json);
+            ESP_LOGI(TAG_APP, "SQL ingest (len=%d)", (int)strlen(json));
+#endif
 
             // --- Envío a Hostinger (igual patrón que ESP32C3 WiFi) ---
-            ESP_LOGI(TAG_APP, "SQL ingest (len=%d)", (int)strlen(json));
             hostinger_ingest_post(json);
 
             // --- Retención aproximada en Hostinger (por tamaño lógico ~10 MB) ---

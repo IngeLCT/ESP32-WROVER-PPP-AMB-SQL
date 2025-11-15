@@ -42,6 +42,10 @@ bool modem_get_ue_info(modem_ue_info_t *out);
 esp_err_t modem_unwiredlabs_city_state(char *city, size_t city_len,
                                        char *state, size_t state_len);
 
+/** Estado y reconexión de PPP */
+bool modem_ppp_is_connected(void);
+bool modem_ppp_reconnect_blocking(uint32_t window_ms);
+
 #ifdef __cplusplus
 }
 #endif

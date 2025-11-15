@@ -46,6 +46,7 @@ static EventGroupHandle_t s_ppp_eg;
 static modem_ue_info_t s_ue_info;   // última UE info válida (CPSI)
 static bool            s_ue_valid;  // hay UE info válida
 static esp_netif_t *s_ppp_netif = NULL;   // guarda el netif PPP para bind
+static esp_modem_dce_t *s_dce     = NULL; // DCE global para reconexión PPP
 
 /* ---------------- PPP / Eventos ---------------- */
 static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
@@ -54,8 +55,11 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
         ESP_LOGI(TAG, "PPP UP  ip=" IPSTR " gw=" IPSTR, IP2STR(&e->ip_info.ip), IP2STR(&e->ip_info.gw));
         xEventGroupSetBits(s_ppp_eg, PPP_UP_BIT);
     } else if (id == IP_EVENT_PPP_LOST_IP) {
-        ESP_LOGW(TAG, "Fallo PPP reiniciando esp...");
-        esp_restart();
+        ESP_LOGW(TAG, "PPP LOST IP (sin reinicio, marcando DOWN)");
+        if (s_ppp_eg) {
+            xEventGroupClearBits(s_ppp_eg, PPP_UP_BIT);
+        }
+        // NO reiniciamos el ESP aquí; la app decidirá si reconecta.
     }
 }
 
@@ -448,6 +452,7 @@ esp_err_t modem_ppp_start_blocking(const modem_ppp_config_t *cfg,
     esp_modem_dce_config_t dce_cfg = ESP_MODEM_DCE_DEFAULT_CONFIG(cfg->apn);
     esp_modem_dce_t *dce = esp_modem_new_dev(ESP_MODEM_DCE_SIM7600, &dte_cfg, &dce_cfg, ppp);
     if (!dce) return ESP_FAIL;
+    s_dce = dce;                  // <--- guardar DCE global
     if (out_dce) *out_dce = dce;
 
     ESP_ERROR_CHECK(esp_modem_set_apn(dce, cfg->apn));
@@ -528,3 +533,63 @@ esp_err_t modem_ppp_start_blocking(const modem_ppp_config_t *cfg,
     return ESP_OK;
 }
 
+/* =================== Helpers de estado y reconexión PPP =================== */
+
+bool modem_ppp_is_connected(void)
+{
+    if (!s_ppp_eg) return false;
+    EventBits_t bits = xEventGroupGetBits(s_ppp_eg);
+    return (bits & PPP_UP_BIT) != 0;
+}
+
+bool modem_ppp_reconnect_blocking(uint32_t window_ms)
+{
+    if (modem_ppp_is_connected()) {
+        // Ya está arriba, no hay nada que hacer
+        return true;
+    }
+
+    if (!s_dce || !s_ppp_eg) {
+        ESP_LOGW(TAG, "PPP reconnect: falta DCE o event group (s_dce=%p, s_ppp_eg=%p)",
+                 (void *)s_dce, (void *)s_ppp_eg);
+        return false;
+    }
+
+    ESP_LOGW(TAG, "Reintentando PPP (window=%" PRIu32 " ms)", window_ms);
+
+    // Limpia el bit de UP por si quedó colgado
+    xEventGroupClearBits(s_ppp_eg, PPP_UP_BIT);
+
+    // 1) Vuelve a COMMAND para asegurarte de que el módem está en modo AT
+    esp_err_t err = set_mode_if_needed(s_dce, ESP_MODEM_MODE_COMMAND);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "No se pudo entrar a COMMAND: %s", esp_err_to_name(err));
+    }
+
+    // 2) Revisa registro de red de nuevo (opcional pero recomendable)
+    (void)esperar_cereg(s_dce, 15000, 500);
+
+    // 3) Regresa a DATA => esp-modem volverá a levantar PPP
+    err = set_mode_if_needed(s_dce, ESP_MODEM_MODE_DATA);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo regresar a DATA/PPP: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    // 4) Espera a que vuelva IP_EVENT_PPP_GOT_IP
+    EventBits_t bits = xEventGroupWaitBits(
+        s_ppp_eg,
+        PPP_UP_BIT,
+        pdFALSE,       // no limpiar al salir
+        pdTRUE,        // esperar todos los bits (sólo PPP_UP_BIT)
+        window_ms ? pdMS_TO_TICKS(window_ms) : portMAX_DELAY
+    );
+
+    if (bits & PPP_UP_BIT) {
+        ESP_LOGI(TAG, "PPP reconectado correctamente");
+        return true;
+    } else {
+        ESP_LOGW(TAG, "Timeout reconectando PPP");
+        return false;
+    }
+}
