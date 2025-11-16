@@ -3,7 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include "privado.h" //Para el Device ID
+#include "Privado.h" //Para el Device ID
 
 #define I2C_MASTER_SCL_IO 19
 #define I2C_MASTER_SDA_IO 18

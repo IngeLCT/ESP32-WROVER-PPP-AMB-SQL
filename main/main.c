@@ -13,9 +13,9 @@
 #include "esp_sntp.h"
 
 // Project
+#include "Privado.h"
 #include "sensors.h"
 #include "hostinger_ingest.h"
-#include "Privado.h"
 
 // PPP / Módem
 #include "modem_ppp.h"
