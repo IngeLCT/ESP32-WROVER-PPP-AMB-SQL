@@ -10,7 +10,6 @@ sdkconfig.old
 
 # Local secrets
 main/Privado.h
-log.ESP32-WROVER-PPP-AMB.20250920231617.txt
 
 # IDE and tooling metadata
 .vscode/
