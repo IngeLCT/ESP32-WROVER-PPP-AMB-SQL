@@ -62,6 +62,7 @@ static void init_sntp_and_time(void) {
     // Zona horaria GMT-6 (ajusta si usas horario de verano distinto)
     setenv("TZ", "UTC6", 1);
     tzset();
+    
 
     // Espera a tener una fecha razonable (> 2021-01-01)
     for (int i = 0; i < 100; ++i) {
