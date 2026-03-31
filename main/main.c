@@ -36,6 +36,8 @@ static char g_city[64]  = "----";
 // Reintentos PPP (similar a WiFi)
 #define PPP_RECONNECT_WINDOW_MS  60000   // Intentar reconectar hasta 60 s
 #define PPP_BACKOFF_IDLE_MS      30000   // Si falla, esperar 30 s y volver a intentar
+#define HOSTINGER_POST_MAX_RETRIES 3
+#define HOSTINGER_POST_RETRY_DELAY_MS 2000
 
 static inline int64_t minutes_to_us(int m) { return (int64_t)m * 60 * 1000000; }
 
@@ -104,8 +106,7 @@ static void sensor_task(void *pv) {
 
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    // "Delete on boot" ahora contra Hostinger / SQL
-    hostinger_delete_all_for_device(DEVICE_ID);
+    // Ya no se realiza borrado al arranque.
 
     // 1 muestra/minuto, envío cada 5 min (igual que el WiFi)
     const int SAMPLE_EVERY_MIN   = 1;
@@ -126,11 +127,6 @@ static void sensor_task(void *pv) {
     uint32_t sum_co2      = 0;
 
     char last_fecha_str[20] = "";
-
-    // Retención aproximada: usaremos contadores como en el WiFi
-    const size_t MAX_BYTES = 10 * 1024 * 1024;
-    static double   avg_size      = 256.0;
-    static uint32_t approx_count  = 0;
 
     while (1) {
 
@@ -209,37 +205,31 @@ static void sensor_task(void *pv) {
 
             char json[384];
 
+            bool include_fecha = first_send ||
+                                 (strncmp(last_fecha_str, fecha_actual,
+                                          sizeof(last_fecha_str)) != 0);
+
             if (first_send) {
-                // Primer envío incluye "inicio"
+                // Primer envío incluye inicio, ciudad y device_id.
                 sensors_format_json(&avg, hora_envio, fecha_actual,
                                     inicio_str, json, sizeof(json));
-                strncpy(last_fecha_str, fecha_actual, sizeof(last_fecha_str) - 1);
-                last_fecha_str[sizeof(last_fecha_str) - 1] = '\0';
-                first_send = false;
+            } else if (include_fecha) {
+                // En siguientes envíos, fecha solo cuando cambia de día.
+                snprintf(json, sizeof(json),
+                    "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
+                    "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
+                    "\"fecha\":\"%s\",\"hora\":\"%s\"}",
+                    avg.pm1p0, avg.pm2p5, avg.pm4p0, avg.pm10p0,
+                    avg.voc, avg.nox, avg.avg_temp, avg.avg_hum,
+                    avg.co2, fecha_actual, hora_envio);
             } else {
-                // En siguientes envíos: sólo incluimos "fecha" cuando cambie de día
-                if (strncmp(last_fecha_str, fecha_actual,
-                            sizeof(last_fecha_str)) != 0) {
-                    snprintf(json, sizeof(json),
-                        "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
-                        "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
-                        "\"fecha\":\"%s\",\"hora\":\"%s\"}",
-                        avg.pm1p0, avg.pm2p5, avg.pm4p0, avg.pm10p0,
-                        avg.voc, avg.nox, avg.avg_temp, avg.avg_hum,
-                        avg.co2, fecha_actual, hora_envio);
-
-                    strncpy(last_fecha_str, fecha_actual,
-                            sizeof(last_fecha_str) - 1);
-                    last_fecha_str[sizeof(last_fecha_str) - 1] = '\0';
-                } else {
-                    snprintf(json, sizeof(json),
-                        "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
-                        "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
-                        "\"hora\":\"%s\"}",
-                        avg.pm1p0, avg.pm2p5, avg.pm4p0, avg.pm10p0,
-                        avg.voc, avg.nox, avg.avg_temp, avg.avg_hum,
-                        avg.co2, hora_envio);
-                }
+                snprintf(json, sizeof(json),
+                    "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
+                    "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
+                    "\"hora\":\"%s\"}",
+                    avg.pm1p0, avg.pm2p5, avg.pm4p0, avg.pm10p0,
+                    avg.voc, avg.nox, avg.avg_temp, avg.avg_hum,
+                    avg.co2, hora_envio);
             }
 
             int batch_minutes = SAMPLES_PER_BATCH * SAMPLE_EVERY_MIN;
@@ -248,33 +238,43 @@ static void sensor_task(void *pv) {
             ESP_LOGI(TAG_APP, "SQL ingest (len=%d)", (int)strlen(json));
 #endif
 
-            // --- Envío a Hostinger (igual patrón que ESP32C3 WiFi) ---
-            hostinger_ingest_post(json);
+            // --- Envío a Hostinger con hasta 3 intentos ---
+            int rc = -1;
+            for (int attempt = 1; attempt <= HOSTINGER_POST_MAX_RETRIES; ++attempt) {
+                rc = hostinger_ingest_post(json);
+                if (rc == 0) {
+                    if (attempt > 1) {
+                        ESP_LOGW(TAG_APP,
+                                 "Envío a Hostinger exitoso en intento %d/%d",
+                                 attempt, HOSTINGER_POST_MAX_RETRIES);
+                    }
+                    break;
+                }
 
-            // --- Retención aproximada en Hostinger (por tamaño lógico ~10 MB) ---
-            size_t item_len = strlen(json);
-            avg_size = (avg_size * 0.9) + (0.1 * (double)item_len);
-            approx_count++;
+                ESP_LOGE(TAG_APP,
+                         "Falló envío a Hostinger rc=%d (intento %d/%d)",
+                         rc, attempt, HOSTINGER_POST_MAX_RETRIES);
 
-            uint32_t max_items  =
-                (uint32_t)(MAX_BYTES / (avg_size > 1.0 ? avg_size : 1.0));
-            uint32_t high_water = max_items + 50;
-
-            if (approx_count > high_water) {
-                int deleted = hostinger_trim_oldest_batch(DEVICE_ID, 50);
-                if (deleted > 0) {
-                    approx_count =
-                        (approx_count > (uint32_t)deleted)
-                            ? (approx_count - (uint32_t)deleted)
-                            : 0;
-                    ESP_LOGI(TAG_APP,
-                             "Retención: borrados %d antiguos. approx_count=%u "
-                             "max_items=%u avg=%.1fB",
-                             deleted, approx_count, max_items, avg_size);
+                if (attempt < HOSTINGER_POST_MAX_RETRIES) {
+                    vTaskDelay(pdMS_TO_TICKS(HOSTINGER_POST_RETRY_DELAY_MS));
                 }
             }
 
-            // Reset de acumuladores SOLO después de enviar
+            if (rc != 0) {
+                ESP_LOGE(TAG_APP,
+                         "Fallaron %d intentos consecutivos a Hostinger. Reiniciando ESP32...",
+                         HOSTINGER_POST_MAX_RETRIES);
+                vTaskDelay(pdMS_TO_TICKS(HOSTINGER_POST_RETRY_DELAY_MS));
+                esp_restart();
+            }
+
+            if (include_fecha) {
+                strncpy(last_fecha_str, fecha_actual, sizeof(last_fecha_str) - 1);
+                last_fecha_str[sizeof(last_fecha_str) - 1] = '\0';
+            }
+            first_send = false;
+
+            // Reset de acumuladores SOLO después de envío exitoso
             sample_count = 0;
             sum_pm1p0 = sum_pm2p5 = sum_pm4p0 = sum_pm10p0 =
             sum_voc   = sum_nox   = sum_avg_temp = sum_avg_hum = 0;
@@ -346,9 +346,9 @@ void app_main(void)
             sensors_set_city_state(g_city);
         } else {
             ESP_LOGW(TAG_APP,
-                     "No se pudo geolocalizar por celda. Ciudad='----'");
-            ESP_LOGW(TAG_APP, "Fallo Ubicacion reiniciando esp...");
-            esp_restart();
+                     "No se pudo geolocalizar por celda. Usaré ciudad='----'");
+            strlcpy(g_city, "----", sizeof(g_city));
+            sensors_set_city_state(g_city);
         }
     } else {
         ESP_LOGW(TAG_APP,
