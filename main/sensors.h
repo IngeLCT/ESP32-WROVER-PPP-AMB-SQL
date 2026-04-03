@@ -1,12 +1,14 @@
 #pragma once
 #include "esp_err.h"
 #include <stdint.h>
+#include <stddef.h>
 
 typedef struct {
     // SCD4x
     uint16_t co2;
     float scd_temp;
     float scd_hum;
+
     // SEN5x
     float pm1p0;
     float pm2p5;
@@ -16,6 +18,7 @@ typedef struct {
     float nox;
     float sen_temp;
     float sen_hum;
+
     // Derivados
     float avg_temp;
     float avg_hum;
@@ -24,11 +27,13 @@ typedef struct {
 // Inicializa I2C y ambos sensores (SEN5x y SCD4x).
 esp_err_t sensors_init_all(void);
 
-// Lee datos de ambos sensores y calcula promedios. Devuelve ESP_OK si todo OK.
+// Lee datos de ambos sensores y calcula promedios.
+// Aplica validaciones de plausibilidad y reintento de confirmación.
 esp_err_t sensors_read(SensorData *out);
 
 // Formatea JSON con claves personalizadas.
-// time_str debe ser HH:MM:SS, fecha_str e inicio_str en formato "YYYY-MM-DD HH:MM:SS".
+// time_str e inicio_str deben ir en formato "HH:MM:SS".
+// fecha_str debe ir en formato "DD-MM-YYYY".
 void sensors_format_json(const SensorData *d,
                          const char *time_str,
                          const char *fecha_str,
@@ -36,5 +41,5 @@ void sensors_format_json(const SensorData *d,
                          char *buf,
                          size_t buf_size);
 
-// Establece ciudad (city-state) obtenida externamente (Geoapify)
+// Establece ciudad (city-state) obtenida externamente.
 void sensors_set_city_state(const char *city_state);
