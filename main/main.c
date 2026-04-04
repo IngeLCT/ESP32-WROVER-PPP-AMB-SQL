@@ -203,33 +203,43 @@ static void sensor_task(void *pv) {
             avg.sen_temp  = avg.avg_temp;
             avg.sen_hum   = avg.avg_hum;
 
-            char json[384];
+            char json[448];
 
             bool include_fecha = first_send ||
-                                 (strncmp(last_fecha_str, fecha_actual,
-                                          sizeof(last_fecha_str)) != 0);
+                                (strncmp(last_fecha_str, fecha_actual,
+                                        sizeof(last_fecha_str)) != 0);
+
+            int sen55_diag = sensors_get_last_sen55_diag();
+            int scd41_diag = sensors_get_last_scd41_diag();
 
             if (first_send) {
-                // Primer envío incluye inicio, ciudad y device_id.
-                sensors_format_json(&avg, hora_envio, fecha_actual,
-                                    inicio_str, json, sizeof(json));
-            } else if (include_fecha) {
-                // En siguientes envíos, fecha solo cuando cambia de día.
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
-                    "\"fecha\":\"%s\",\"hora\":\"%s\"}",
+                    "\"fecha\":\"%s\",\"inicio\":\"%s\",\"ciudad\":\"%s\",\"hora\":\"%s\","
+                    "\"device_id\":\"%s\",\"sen55\":\"%02d\",\"scd41\":\"%02d\"}",
                     avg.pm1p0, avg.pm2p5, avg.pm4p0, avg.pm10p0,
                     avg.voc, avg.nox, avg.avg_temp, avg.avg_hum,
-                    avg.co2, fecha_actual, hora_envio);
+                    avg.co2, fecha_actual, inicio_str, g_city, hora_envio,
+                    DEVICE_ID, sen55_diag, scd41_diag);
+
+            } else if (include_fecha) {
+                snprintf(json, sizeof(json),
+                    "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
+                    "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
+                    "\"fecha\":\"%s\",\"hora\":\"%s\",\"sen55\":\"%02d\",\"scd41\":\"%02d\"}",
+                    avg.pm1p0, avg.pm2p5, avg.pm4p0, avg.pm10p0,
+                    avg.voc, avg.nox, avg.avg_temp, avg.avg_hum,
+                    avg.co2, fecha_actual, hora_envio, sen55_diag, scd41_diag);
+
             } else {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
-                    "\"hora\":\"%s\"}",
+                    "\"hora\":\"%s\",\"sen55\":\"%02d\",\"scd41\":\"%02d\"}",
                     avg.pm1p0, avg.pm2p5, avg.pm4p0, avg.pm10p0,
                     avg.voc, avg.nox, avg.avg_temp, avg.avg_hum,
-                    avg.co2, hora_envio);
+                    avg.co2, hora_envio, sen55_diag, scd41_diag);
             }
 
             int batch_minutes = SAMPLES_PER_BATCH * SAMPLE_EVERY_MIN;

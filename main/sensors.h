@@ -24,11 +24,21 @@ typedef struct {
     float avg_hum;
 } SensorData;
 
+// Códigos de diagnóstico
+typedef enum {
+    SENSOR_DIAG_OK           = 0,   // 00
+    SENSOR_DIAG_CRC          = 1,   // 01
+    SENSOR_DIAG_TIMEOUT      = 2,   // 02
+    SENSOR_DIAG_OUT_OF_RANGE = 3,   // 03
+    SENSOR_DIAG_I2C_TX       = 4,   // 04
+    SENSOR_DIAG_I2C_RX       = 5,   // 05
+    SENSOR_DIAG_OTHER        = 99   // 99
+} sensor_diag_code_t;
+
 // Inicializa I2C y ambos sensores (SEN5x y SCD4x).
 esp_err_t sensors_init_all(void);
 
-// Lee datos de ambos sensores y calcula promedios.
-// Aplica validaciones de plausibilidad y reintento de confirmación.
+// Lee datos de ambos sensores y calcula promedios. Devuelve ESP_OK si todo OK.
 esp_err_t sensors_read(SensorData *out);
 
 // Formatea JSON con claves personalizadas.
@@ -41,5 +51,10 @@ void sensors_format_json(const SensorData *d,
                          char *buf,
                          size_t buf_size);
 
-// Establece ciudad (city-state) obtenida externamente.
+// Establece ciudad (city-state) obtenida externamente
 void sensors_set_city_state(const char *city_state);
+
+// Getters de diagnóstico del último intento de lectura
+int sensors_get_last_scd41_diag(void);
+int sensors_get_last_sen55_diag(void);
+void sensors_reset_diag(void);
