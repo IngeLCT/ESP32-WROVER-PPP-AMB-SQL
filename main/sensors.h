@@ -35,10 +35,14 @@ typedef enum {
     SENSOR_DIAG_OTHER        = 99   // 99
 } sensor_diag_code_t;
 
-// Inicializa I2C y ambos sensores (SEN5x y SCD4x).
+// Inicializa I2C y ambos sensores
 esp_err_t sensors_init_all(void);
 
-// Lee datos de ambos sensores y calcula promedios. Devuelve ESP_OK si todo OK.
+// Lectura separada por sensor
+esp_err_t sensors_read_scd41(SensorData *out);
+esp_err_t sensors_read_sen55(SensorData *out);
+
+// Wrapper opcional: lee ambos sensores
 esp_err_t sensors_read(SensorData *out);
 
 // Formatea JSON con claves personalizadas.
@@ -54,7 +58,7 @@ void sensors_format_json(const SensorData *d,
 // Establece ciudad (city-state) obtenida externamente
 void sensors_set_city_state(const char *city_state);
 
-// Getters de diagnóstico del último intento de lectura
+// Getters de diagnóstico del último intento
 int sensors_get_last_scd41_diag(void);
 int sensors_get_last_sen55_diag(void);
 void sensors_reset_diag(void);

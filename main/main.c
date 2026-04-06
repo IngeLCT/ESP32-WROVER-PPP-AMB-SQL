@@ -38,6 +38,7 @@ static char g_city[64]  = "----";
 #define PPP_BACKOFF_IDLE_MS      30000   // Si falla, esperar 30 s y volver a intentar
 #define HOSTINGER_POST_MAX_RETRIES 3
 #define HOSTINGER_POST_RETRY_DELAY_MS 2000
+#define BATCH_SLOTS 5
 
 static inline int64_t minutes_to_us(int m) { return (int64_t)m * 60 * 1000000; }
 
@@ -92,7 +93,7 @@ static void build_city_hyphen(char *dst, size_t dstlen, const char *city, const 
 
 // ----------------- TASK DE SENSORES + HOSTINGER (PPP) -----------------
 static void sensor_task(void *pv) {
-    SensorData data;
+    //SensorData data;
 
     // Hora de arranque (inicio) para JSON de primer envío
     time_t start_epoch;
@@ -108,23 +109,29 @@ static void sensor_task(void *pv) {
 
     // Ya no se realiza borrado al arranque.
 
-    // 1 muestra/minuto, envío cada 5 min (igual que el WiFi)
-    const int SAMPLE_EVERY_MIN   = 1;
-    const int SAMPLES_PER_BATCH  = 5;
-    const TickType_t SAMPLE_DELAY_TICKS =
-        pdMS_TO_TICKS(SAMPLE_EVERY_MIN * 60000);
+    const TickType_t SAMPLE_DELAY_TICKS = pdMS_TO_TICKS(60000);
 
-    int sample_count = 0;
+    int batch_slot = 0;
 
-    double   sum_pm1p0    = 0;
-    double   sum_pm2p5    = 0;
-    double   sum_pm4p0    = 0;
-    double   sum_pm10p0   = 0;
-    double   sum_voc      = 0;
-    double   sum_nox      = 0;
-    double   sum_avg_temp = 0;
-    double   sum_avg_hum  = 0;
-    uint32_t sum_co2      = 0;
+    // SCD41: siempre guardamos 5 slots, válidos o no
+    uint16_t scd41_co2_vals[BATCH_SLOTS] = {0};
+    int scd41_diag_vals[BATCH_SLOTS] = {0};
+    uint32_t sum_co2 = 0;
+    int scd41_valid_count = 0;
+
+    // SEN55: también guardamos 5 códigos de diagnóstico,
+    // pero solo promediamos lecturas válidas
+    int sen55_diag_vals[BATCH_SLOTS] = {0};
+    int sen55_valid_count = 0;
+
+    double sum_pm1p0    = 0;
+    double sum_pm2p5    = 0;
+    double sum_pm4p0    = 0;
+    double sum_pm10p0   = 0;
+    double sum_voc      = 0;
+    double sum_nox      = 0;
+    double sum_avg_temp = 0;
+    double sum_avg_hum  = 0;
 
     char last_fecha_str[20] = "";
 
@@ -136,17 +143,34 @@ static void sensor_task(void *pv) {
             bool ok = modem_ppp_reconnect_blocking(PPP_RECONNECT_WINDOW_MS);
             if (!ok) {
                 ESP_LOGW(TAG_APP,
-                         "No se logró reconectar PPP, espero %d ms",
-                         PPP_BACKOFF_IDLE_MS);
+                        "No se logró reconectar PPP, espero %d ms",
+                        PPP_BACKOFF_IDLE_MS);
                 vTaskDelay(pdMS_TO_TICKS(PPP_BACKOFF_IDLE_MS));
-                continue; // NO leer, NO acumular, NO enviar
+                continue;
             }
             ESP_LOGI(TAG_APP, "PPP reconectado; reanudo medición/envío");
         }
 
-        // Lectura de sensores
-        if (sensors_read(&data) == ESP_OK) {
-            sample_count++;
+        SensorData data = {0};
+
+        // ----------------- SCD41 -----------------
+        esp_err_t scd_ret = sensors_read_scd41(&data);
+        int scd_diag = sensors_get_last_scd41_diag();
+
+        if (scd_ret == ESP_OK) {
+            scd41_co2_vals[batch_slot] = data.co2;
+            sum_co2 += data.co2;
+            scd41_valid_count++;
+        } else {
+            scd41_co2_vals[batch_slot] = 0;
+        }
+        scd41_diag_vals[batch_slot] = scd_diag;
+
+        // ----------------- SEN55 -----------------
+        esp_err_t sen_ret = sensors_read_sen55(&data);
+        int sen_diag = sensors_get_last_sen55_diag();
+
+        if (sen_ret == ESP_OK) {
             sum_pm1p0    += data.pm1p0;
             sum_pm2p5    += data.pm2p5;
             sum_pm4p0    += data.pm4p0;
@@ -155,21 +179,25 @@ static void sensor_task(void *pv) {
             sum_nox      += data.nox;
             sum_avg_temp += data.avg_temp;
             sum_avg_hum  += data.avg_hum;
-            sum_co2      += data.co2;
-
-#if LOG_EACH_SAMPLE
-            ESP_LOGI(TAG_APP,
-                "Muestra %d/%d: PM1.0=%.2f PM2.5=%.2f PM4.0=%.2f PM10=%.2f "
-                "VOC=%.1f NOx=%.1f CO2=%u Temp=%.2fC Hum=%.2f%%",
-                sample_count, SAMPLES_PER_BATCH,
-                data.pm1p0, data.pm2p5, data.pm4p0, data.pm10p0,
-                data.voc, data.nox, data.co2, data.avg_temp, data.avg_hum);
-#endif
-        } else {
-            ESP_LOGW(TAG_APP, "Error leyendo sensores (batch %d)", sample_count);
+            sen55_valid_count++;
         }
+        sen55_diag_vals[batch_slot] = sen_diag;
 
-        if (sample_count >= SAMPLES_PER_BATCH) {
+    #if LOG_EACH_SAMPLE
+        ESP_LOGI(TAG_APP,
+            "Slot %d/5 | SCD41: co2=%u diag=%02d ret=%s | SEN55: diag=%02d ret=%s",
+            batch_slot + 1,
+            scd41_co2_vals[batch_slot],
+            scd41_diag_vals[batch_slot],
+            esp_err_to_name(scd_ret),
+            sen55_diag_vals[batch_slot],
+            esp_err_to_name(sen_ret));
+    #endif
+
+        batch_slot++;
+
+        // Enviamos cada 5 intentos exactos
+        if (batch_slot >= BATCH_SLOTS) {
             // Timestamp actual
             time_t now_epoch;
             struct tm tm_info;
@@ -180,73 +208,115 @@ static void sensor_task(void *pv) {
             strftime(hora_envio, sizeof(hora_envio), "%H:%M:%S", &tm_info);
 
             char fecha_actual[20];
-            // IMPORTANTE: mismo formato que el WiFi => DD-MM-YYYY
             strftime(fecha_actual, sizeof(fecha_actual), "%d-%m-%Y", &tm_info);
 
             // Promedios
             SensorData avg = (SensorData){0};
-            double denom   = (double)sample_count;
 
-            avg.pm1p0     = (float)(sum_pm1p0    / denom);
-            avg.pm2p5     = (float)(sum_pm2p5    / denom);
-            avg.pm4p0     = (float)(sum_pm4p0    / denom);
-            avg.pm10p0    = (float)(sum_pm10p0   / denom);
-            avg.voc       = (float)(sum_voc      / denom);
-            avg.nox       = (float)(sum_nox      / denom);
-            avg.avg_temp  = (float)(sum_avg_temp / denom);
-            avg.avg_hum   = (float)(sum_avg_hum  / denom);
-            avg.co2       = (uint16_t)(sum_co2 / sample_count);
+            if (scd41_valid_count > 0) {
+                avg.co2 = (uint16_t)(sum_co2 / scd41_valid_count);
+            } else {
+                avg.co2 = 0;
+            }
 
-            // Copiamos la misma convención que en WiFi:
-            avg.scd_temp  = avg.avg_temp;
-            avg.scd_hum   = avg.avg_hum;
-            avg.sen_temp  = avg.avg_temp;
-            avg.sen_hum   = avg.avg_hum;
+            if (sen55_valid_count > 0) {
+                double denom = (double)sen55_valid_count;
+                avg.pm1p0    = (float)(sum_pm1p0    / denom);
+                avg.pm2p5    = (float)(sum_pm2p5    / denom);
+                avg.pm4p0    = (float)(sum_pm4p0    / denom);
+                avg.pm10p0   = (float)(sum_pm10p0   / denom);
+                avg.voc      = (float)(sum_voc      / denom);
+                avg.nox      = (float)(sum_nox      / denom);
+                avg.avg_temp = (float)(sum_avg_temp / denom);
+                avg.avg_hum  = (float)(sum_avg_hum  / denom);
 
-            char json[448];
+                avg.scd_temp = avg.avg_temp;
+                avg.scd_hum  = avg.avg_hum;
+                avg.sen_temp = avg.avg_temp;
+                avg.sen_hum  = avg.avg_hum;
+            }
+
+            // Strings de debug
+            char scd41_co2_str[64];
+            char scd41_diag_str[32];
+            char sen55_diag_str[32];
+            int off = 0;
+
+            scd41_co2_str[0] = '\0';
+            scd41_diag_str[0] = '\0';
+            sen55_diag_str[0] = '\0';
+
+            off = 0;
+            for (int i = 0; i < BATCH_SLOTS; ++i) {
+                off += snprintf(scd41_co2_str + off,
+                                sizeof(scd41_co2_str) - off,
+                                (i == 0) ? "%u" : ",%u",
+                                scd41_co2_vals[i]);
+                if (off >= (int)sizeof(scd41_co2_str)) break;
+            }
+
+            off = 0;
+            for (int i = 0; i < BATCH_SLOTS; ++i) {
+                off += snprintf(scd41_diag_str + off,
+                                sizeof(scd41_diag_str) - off,
+                                (i == 0) ? "%02d" : ",%02d",
+                                scd41_diag_vals[i]);
+                if (off >= (int)sizeof(scd41_diag_str)) break;
+            }
+
+            off = 0;
+            for (int i = 0; i < BATCH_SLOTS; ++i) {
+                off += snprintf(sen55_diag_str + off,
+                                sizeof(sen55_diag_str) - off,
+                                (i == 0) ? "%02d" : ",%02d",
+                                sen55_diag_vals[i]);
+                if (off >= (int)sizeof(sen55_diag_str)) break;
+            }
+
+            char json[640];
 
             bool include_fecha = first_send ||
                                 (strncmp(last_fecha_str, fecha_actual,
                                         sizeof(last_fecha_str)) != 0);
 
-            int sen55_diag = sensors_get_last_sen55_diag();
-            int scd41_diag = sensors_get_last_scd41_diag();
-
             if (first_send) {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
+                    "\"scd41_co2\":\"%s\",\"scd41_diag\":\"%s\",\"sen55_diag\":\"%s\","
                     "\"fecha\":\"%s\",\"inicio\":\"%s\",\"ciudad\":\"%s\",\"hora\":\"%s\","
-                    "\"device_id\":\"%s\",\"sen55\":\"%02d\",\"scd41\":\"%02d\"}",
+                    "\"device_id\":\"%s\"}",
                     avg.pm1p0, avg.pm2p5, avg.pm4p0, avg.pm10p0,
-                    avg.voc, avg.nox, avg.avg_temp, avg.avg_hum,
-                    avg.co2, fecha_actual, inicio_str, g_city, hora_envio,
-                    DEVICE_ID, sen55_diag, scd41_diag);
+                    avg.voc, avg.nox, avg.avg_temp, avg.avg_hum, avg.co2,
+                    scd41_co2_str, scd41_diag_str, sen55_diag_str,
+                    fecha_actual, inicio_str, g_city, hora_envio, DEVICE_ID);
 
             } else if (include_fecha) {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
-                    "\"fecha\":\"%s\",\"hora\":\"%s\",\"sen55\":\"%02d\",\"scd41\":\"%02d\"}",
+                    "\"scd41_co2\":\"%s\",\"scd41_diag\":\"%s\",\"sen55_diag\":\"%s\","
+                    "\"fecha\":\"%s\",\"hora\":\"%s\"}",
                     avg.pm1p0, avg.pm2p5, avg.pm4p0, avg.pm10p0,
-                    avg.voc, avg.nox, avg.avg_temp, avg.avg_hum,
-                    avg.co2, fecha_actual, hora_envio, sen55_diag, scd41_diag);
+                    avg.voc, avg.nox, avg.avg_temp, avg.avg_hum, avg.co2,
+                    scd41_co2_str, scd41_diag_str, sen55_diag_str,
+                    fecha_actual, hora_envio);
 
             } else {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
-                    "\"hora\":\"%s\",\"sen55\":\"%02d\",\"scd41\":\"%02d\"}",
+                    "\"scd41_co2\":\"%s\",\"scd41_diag\":\"%s\",\"sen55_diag\":\"%s\","
+                    "\"hora\":\"%s\"}",
                     avg.pm1p0, avg.pm2p5, avg.pm4p0, avg.pm10p0,
-                    avg.voc, avg.nox, avg.avg_temp, avg.avg_hum,
-                    avg.co2, hora_envio, sen55_diag, scd41_diag);
+                    avg.voc, avg.nox, avg.avg_temp, avg.avg_hum, avg.co2,
+                    scd41_co2_str, scd41_diag_str, sen55_diag_str,
+                    hora_envio);
             }
 
-            int batch_minutes = SAMPLES_PER_BATCH * SAMPLE_EVERY_MIN;
-#if LOG_EACH_SAMPLE
-            ESP_LOGI(TAG_APP, "JSON promedio %dm: %s", batch_minutes, json);
-            ESP_LOGI(TAG_APP, "SQL ingest (len=%d)", (int)strlen(json));
-#endif
+    #if LOG_EACH_SAMPLE
+            ESP_LOGI(TAG_APP, "JSON promedio/debug: %s", json);
+    #endif
 
             // --- Envío a Hostinger con hasta 3 intentos ---
             int rc = -1;
@@ -255,15 +325,15 @@ static void sensor_task(void *pv) {
                 if (rc == 0) {
                     if (attempt > 1) {
                         ESP_LOGW(TAG_APP,
-                                 "Envío a Hostinger exitoso en intento %d/%d",
-                                 attempt, HOSTINGER_POST_MAX_RETRIES);
+                                "Envío a Hostinger exitoso en intento %d/%d",
+                                attempt, HOSTINGER_POST_MAX_RETRIES);
                     }
                     break;
                 }
 
                 ESP_LOGE(TAG_APP,
-                         "Falló envío a Hostinger rc=%d (intento %d/%d)",
-                         rc, attempt, HOSTINGER_POST_MAX_RETRIES);
+                        "Falló envío a Hostinger rc=%d (intento %d/%d)",
+                        rc, attempt, HOSTINGER_POST_MAX_RETRIES);
 
                 if (attempt < HOSTINGER_POST_MAX_RETRIES) {
                     vTaskDelay(pdMS_TO_TICKS(HOSTINGER_POST_RETRY_DELAY_MS));
@@ -272,8 +342,8 @@ static void sensor_task(void *pv) {
 
             if (rc != 0) {
                 ESP_LOGE(TAG_APP,
-                         "Fallaron %d intentos consecutivos a Hostinger. Reiniciando ESP32...",
-                         HOSTINGER_POST_MAX_RETRIES);
+                        "Fallaron %d intentos consecutivos a Hostinger. Reiniciando ESP32...",
+                        HOSTINGER_POST_MAX_RETRIES);
                 vTaskDelay(pdMS_TO_TICKS(HOSTINGER_POST_RETRY_DELAY_MS));
                 esp_restart();
             }
@@ -284,11 +354,19 @@ static void sensor_task(void *pv) {
             }
             first_send = false;
 
-            // Reset de acumuladores SOLO después de envío exitoso
-            sample_count = 0;
-            sum_pm1p0 = sum_pm2p5 = sum_pm4p0 = sum_pm10p0 =
+            // Reset del batch
+            batch_slot = 0;
+
+            memset(scd41_co2_vals, 0, sizeof(scd41_co2_vals));
+            memset(scd41_diag_vals, 0, sizeof(scd41_diag_vals));
+            memset(sen55_diag_vals, 0, sizeof(sen55_diag_vals));
+
+            sum_co2 = 0;
+            scd41_valid_count = 0;
+            sen55_valid_count = 0;
+
+            sum_pm1p0 = sum_pm2p5 = sum_pm4p0 = sum_pm10p0 = 0;
             sum_voc   = sum_nox   = sum_avg_temp = sum_avg_hum = 0;
-            sum_co2   = 0;
         }
 
         vTaskDelay(SAMPLE_DELAY_TICKS);

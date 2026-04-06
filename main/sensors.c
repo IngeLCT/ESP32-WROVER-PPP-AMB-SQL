@@ -3,24 +3,30 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include "Privado.h" // Para DEVICE_ID
+#include "Privado.h" // DEVICE_ID
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdarg.h>
 
-#define I2C_MASTER_SCL_IO 19
-#define I2C_MASTER_SDA_IO 18
-#define I2C_MASTER_FREQ_HZ 100000
-#define I2C_PORT I2C_NUM_0
+#define I2C_MASTER_SCL_IO       19
+#define I2C_MASTER_SDA_IO       18
+#define I2C_MASTER_FREQ_HZ      100000
+#define I2C_PORT                I2C_NUM_0
 
-#define SCD4X_ADDR 0x62
-#define SEN5X_ADDR 0x69
+#define SCD4X_ADDR              0x62
+#define SEN5X_ADDR              0x69
+
+#define SCD41_CO2_MIN           250
+#define SCD41_CO2_MAX           10000
+
+#define SEN55_READY_POLLS       30
+#define SEN55_READY_DELAY_MS    20
 
 static const char *TAG_SENS = "SENSORS";
 static char g_city_state[64] = "----";
 
-// --- New I2C v2 bus/device handles ---
+// --- I2C v2 bus/device handles ---
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
 static i2c_master_dev_handle_t s_scd4x_dev = NULL;
 static i2c_master_dev_handle_t s_sen5x_dev = NULL;
@@ -30,7 +36,7 @@ static int s_last_scd41_diag = SENSOR_DIAG_OK;
 static int s_last_sen55_diag = SENSOR_DIAG_OK;
 
 // ---------- Helpers de diagnóstico ----------
-static int map_err_to_diag(esp_err_t err, bool is_rx_stage) {
+static int map_i2c_err_to_diag(esp_err_t err, bool is_rx_stage) {
     if (err == ESP_OK) return SENSOR_DIAG_OK;
     if (err == ESP_ERR_INVALID_CRC) return SENSOR_DIAG_CRC;
     if (err == ESP_ERR_TIMEOUT) return SENSOR_DIAG_TIMEOUT;
@@ -51,7 +57,7 @@ void sensors_reset_diag(void) {
     s_last_sen55_diag = SENSOR_DIAG_OK;
 }
 
-// CRC8 (Sensirion)
+// ---------- CRC8 Sensirion ----------
 static uint8_t sensirion_crc8(const uint8_t *data, int len) {
     uint8_t crc = 0xFF;
     for (int i = 0; i < len; i++) {
@@ -64,7 +70,7 @@ static uint8_t sensirion_crc8(const uint8_t *data, int len) {
     return crc;
 }
 
-// ---------- SCD4x helpers ----------
+// ---------- SCD4x low level ----------
 static esp_err_t scd4x_start_measurement(void) {
     uint8_t cmd[2] = {0x21, 0xB1};
     return i2c_master_transmit(s_scd4x_dev, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
@@ -76,7 +82,7 @@ static esp_err_t scd4x_read_measurement(uint16_t *co2, float *temperature, float
     uint8_t cmd[2] = {0xEC, 0x05};
     esp_err_t ret = i2c_master_transmit(s_scd4x_dev, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
     if (ret != ESP_OK) {
-        s_last_scd41_diag = map_err_to_diag(ret, false);
+        s_last_scd41_diag = map_i2c_err_to_diag(ret, false);
         return ret;
     }
 
@@ -85,36 +91,36 @@ static esp_err_t scd4x_read_measurement(uint16_t *co2, float *temperature, float
     uint8_t data[9];
     ret = i2c_master_receive(s_scd4x_dev, data, sizeof(data), pdMS_TO_TICKS(1000));
     if (ret != ESP_OK) {
-        s_last_scd41_diag = map_err_to_diag(ret, true);
+        s_last_scd41_diag = map_i2c_err_to_diag(ret, true);
         return ret;
     }
 
     if (sensirion_crc8(&data[0], 2) != data[2] ||
         sensirion_crc8(&data[3], 2) != data[5] ||
         sensirion_crc8(&data[6], 2) != data[8]) {
-        ESP_LOGW(TAG_SENS, "SCD4x CRC inválido");
+        ESP_LOGW(TAG_SENS, "SCD41 CRC inválido");
         s_last_scd41_diag = SENSOR_DIAG_CRC;
         return ESP_ERR_INVALID_CRC;
     }
 
-    *co2 = (data[0] << 8) | data[1];
-    if (*co2 == 0 || *co2 < 250 || *co2 > 10000) {
-        ESP_LOGW(TAG_SENS, "SCD4x CO2 inválido: %u ppm", *co2);
+    *co2 = ((uint16_t)data[0] << 8) | data[1];
+    if (*co2 == 0 || *co2 < SCD41_CO2_MIN || *co2 > SCD41_CO2_MAX) {
+        ESP_LOGW(TAG_SENS, "SCD41 CO2 inválido: %u ppm", *co2);
         s_last_scd41_diag = SENSOR_DIAG_OUT_OF_RANGE;
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    uint16_t raw_temp = (data[3] << 8) | data[4];
-    uint16_t raw_hum  = (data[6] << 8) | data[7];
+    uint16_t raw_temp = ((uint16_t)data[3] << 8) | data[4];
+    uint16_t raw_hum  = ((uint16_t)data[6] << 8) | data[7];
 
-    *temperature = -45 + 175 * ((float)raw_temp / 65535.0f);
+    *temperature = -45.0f + 175.0f * ((float)raw_temp / 65535.0f);
     *humidity    = 100.0f * ((float)raw_hum / 65535.0f);
 
     s_last_scd41_diag = SENSOR_DIAG_OK;
     return ESP_OK;
 }
 
-// ---------- SEN5x helpers ----------
+// ---------- SEN5x low level ----------
 static esp_err_t sen5x_device_reset(void) {
     uint8_t cmd[2] = {0xD3, 0x04};
     return i2c_master_transmit(s_sen5x_dev, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
@@ -129,7 +135,7 @@ static esp_err_t sen5x_read_data_ready(uint8_t *data_ready) {
     uint8_t cmd[2] = {0x02, 0x02};
     esp_err_t ret = i2c_master_transmit(s_sen5x_dev, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
     if (ret != ESP_OK) {
-        s_last_sen55_diag = map_err_to_diag(ret, false);
+        s_last_sen55_diag = map_i2c_err_to_diag(ret, false);
         return ret;
     }
 
@@ -138,7 +144,7 @@ static esp_err_t sen5x_read_data_ready(uint8_t *data_ready) {
     uint8_t resp[3];
     ret = i2c_master_receive(s_sen5x_dev, resp, sizeof(resp), pdMS_TO_TICKS(1000));
     if (ret != ESP_OK) {
-        s_last_sen55_diag = map_err_to_diag(ret, true);
+        s_last_sen55_diag = map_i2c_err_to_diag(ret, true);
         return ret;
     }
 
@@ -155,7 +161,7 @@ static esp_err_t sen5x_read_measured_values(uint8_t *buf, int buflen) {
     uint8_t cmd[2] = {0x03, 0xC4};
     esp_err_t ret = i2c_master_transmit(s_sen5x_dev, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
     if (ret != ESP_OK) {
-        s_last_sen55_diag = map_err_to_diag(ret, false);
+        s_last_sen55_diag = map_i2c_err_to_diag(ret, false);
         return ret;
     }
 
@@ -163,7 +169,7 @@ static esp_err_t sen5x_read_measured_values(uint8_t *buf, int buflen) {
 
     ret = i2c_master_receive(s_sen5x_dev, buf, buflen, pdMS_TO_TICKS(1000));
     if (ret != ESP_OK) {
-        s_last_sen55_diag = map_err_to_diag(ret, true);
+        s_last_sen55_diag = map_i2c_err_to_diag(ret, true);
         return ret;
     }
 
@@ -252,36 +258,52 @@ esp_err_t sensors_init_all(void) {
     return ESP_OK;
 }
 
-esp_err_t sensors_read(SensorData *out) {
+esp_err_t sensors_read_scd41(SensorData *out) {
     if (!out) return ESP_ERR_INVALID_ARG;
 
-    sensors_reset_diag();
+    uint16_t co2 = 0;
+    float temp = 0.0f, hum = 0.0f;
 
-    uint16_t co2;
-    float scd_temp, scd_hum;
-    uint8_t data_ready = 0;
-    uint8_t buf[24];
-
-    esp_err_t ret = scd4x_read_measurement(&co2, &scd_temp, &scd_hum);
+    esp_err_t ret = scd4x_read_measurement(&co2, &temp, &hum);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    int timeout = 30;
-    do {
+    out->co2 = co2;
+    out->scd_temp = temp;
+    out->scd_hum = hum;
+    return ESP_OK;
+}
+
+esp_err_t sensors_read_sen55(SensorData *out) {
+    if (!out) return ESP_ERR_INVALID_ARG;
+
+    s_last_sen55_diag = SENSOR_DIAG_OK;
+
+    uint8_t data_ready = 0;
+    bool ready = false;
+    esp_err_t ret;
+
+    for (int i = 0; i < SEN55_READY_POLLS; ++i) {
         ret = sen5x_read_data_ready(&data_ready);
         if (ret != ESP_OK) {
             return ret;
         }
-        if (data_ready == 1) break;
-        vTaskDelay(pdMS_TO_TICKS(20));
-    } while (--timeout > 0);
 
-    if (data_ready != 1) {
+        if (data_ready == 1) {
+            ready = true;
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(SEN55_READY_DELAY_MS));
+    }
+
+    if (!ready) {
         s_last_sen55_diag = SENSOR_DIAG_TIMEOUT;
         return ESP_ERR_TIMEOUT;
     }
 
+    uint8_t buf[24];
     ret = sen5x_read_measured_values(buf, sizeof(buf));
     if (ret != ESP_OK) {
         return ret;
@@ -292,9 +314,6 @@ esp_err_t sensors_read(SensorData *out) {
         return ESP_ERR_INVALID_CRC;
     }
 
-    out->co2 = co2;
-    out->scd_temp = scd_temp;
-    out->scd_hum = scd_hum;
     out->pm1p0 = pm1;
     out->pm2p5 = pm25;
     out->pm4p0 = pm4;
@@ -303,11 +322,30 @@ esp_err_t sensors_read(SensorData *out) {
     out->nox = nox;
     out->sen_temp = temp;
     out->sen_hum = rh;
-    out->avg_temp = (scd_temp + temp) / 2.0f;
-    out->avg_hum = (scd_hum + rh) / 2.0f;
 
-    // Si todo salió bien, marcar SEN55 OK explícitamente
+    // Promedios solo con la info disponible en esta llamada.
+    // Si antes ya se leyó SCD41 en el mismo struct, esto queda consistente.
+    if (out->scd_temp != 0.0f || out->scd_hum != 0.0f) {
+        out->avg_temp = (out->scd_temp + temp) / 2.0f;
+        out->avg_hum  = (out->scd_hum + rh) / 2.0f;
+    } else {
+        out->avg_temp = temp;
+        out->avg_hum  = rh;
+    }
+
     s_last_sen55_diag = SENSOR_DIAG_OK;
+    return ESP_OK;
+}
+
+esp_err_t sensors_read(SensorData *out) {
+    if (!out) return ESP_ERR_INVALID_ARG;
+
+    esp_err_t ret = sensors_read_scd41(out);
+    if (ret != ESP_OK) return ret;
+
+    ret = sensors_read_sen55(out);
+    if (ret != ESP_OK) return ret;
+
     return ESP_OK;
 }
 
@@ -317,7 +355,7 @@ void sensors_format_json(const SensorData *d,
                          const char *inicio_str,
                          char *buf,
                          size_t buf_size) {
-    if (!buf || buf_size == 0) return;
+    if (!buf || buf_size == 0 || !d) return;
 
     int written = snprintf(
         buf, buf_size,
@@ -331,14 +369,16 @@ void sensors_format_json(const SensorData *d,
     );
 
     if (written < 0 || (size_t)written >= buf_size) {
-        if (buf_size) buf[buf_size - 1] = '\0';
+        buf[buf_size - 1] = '\0';
     }
 }
 
 void sensors_set_city_state(const char *city_state) {
     if (!city_state) return;
+
     size_t len = strlen(city_state);
     if (len >= sizeof(g_city_state)) len = sizeof(g_city_state) - 1;
+
     memcpy(g_city_state, city_state, len);
     g_city_state[len] = '\0';
 }
