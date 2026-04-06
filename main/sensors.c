@@ -265,14 +265,13 @@ esp_err_t sensors_read_scd41(SensorData *out) {
     float temp = 0.0f, hum = 0.0f;
 
     esp_err_t ret = scd4x_read_measurement(&co2, &temp, &hum);
-    if (ret != ESP_OK) {
-        return ret;
-    }
 
+    // Guardar siempre lo que haya llegado, aunque el valor quede fuera de rango
     out->co2 = co2;
     out->scd_temp = temp;
     out->scd_hum = hum;
-    return ESP_OK;
+
+    return ret;
 }
 
 esp_err_t sensors_read_sen55(SensorData *out) {

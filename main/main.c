@@ -157,14 +157,15 @@ static void sensor_task(void *pv) {
         esp_err_t scd_ret = sensors_read_scd41(&data);
         int scd_diag = sensors_get_last_scd41_diag();
 
+        // Guardar siempre el valor recibido, aunque venga con error 03
+        scd41_co2_vals[batch_slot] = data.co2;
+        scd41_diag_vals[batch_slot] = scd_diag;
+
+        // Solo usarlo para el promedio si fue lectura válida
         if (scd_ret == ESP_OK) {
-            scd41_co2_vals[batch_slot] = data.co2;
             sum_co2 += data.co2;
             scd41_valid_count++;
-        } else {
-            scd41_co2_vals[batch_slot] = 0;
         }
-        scd41_diag_vals[batch_slot] = scd_diag;
 
         // ----------------- SEN55 -----------------
         esp_err_t sen_ret = sensors_read_sen55(&data);
