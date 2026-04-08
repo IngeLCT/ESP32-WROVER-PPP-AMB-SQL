@@ -16,6 +16,7 @@
 #include "Privado.h"
 #include "sensors.h"
 #include "hostinger_ingest.h"
+#include "ota_update.h"
 
 // PPP / Módem
 #include "modem_ppp.h"
@@ -23,6 +24,7 @@
 
 // Solo para apagar WiFi duro (liberar netifs, etc.)
 #include "esp_wifi.h"
+#include "esp_app_desc.h"
 
 static const char *TAG_APP = "app";
 static esp_modem_dce_t *g_dce = NULL;
@@ -38,9 +40,52 @@ static char g_city[64]  = "----";
 #define PPP_BACKOFF_IDLE_MS      30000   // Si falla, esperar 30 s y volver a intentar
 #define HOSTINGER_POST_MAX_RETRIES 3
 #define HOSTINGER_POST_RETRY_DELAY_MS 2000
-#define BATCH_SLOTS 5
+#define SAMPLE_DELAY_MS 5000
+#define SAMPLES_PER_MINUTE 12
 
-static inline int64_t minutes_to_us(int m) { return (int64_t)m * 60 * 1000000; }
+static void build_csv_u16(char *dst, size_t dstlen, const uint16_t *values, size_t count) {
+    if (!dst || dstlen == 0) return;
+
+    dst[0] = '\0';
+    size_t off = 0;
+    for (size_t i = 0; i < count && off < dstlen; ++i) {
+        int written = snprintf(dst + off,
+                               dstlen - off,
+                               (i == 0) ? "%u" : ",%u",
+                               values[i]);
+        if (written < 0) {
+            dst[0] = '\0';
+            return;
+        }
+        if ((size_t)written >= (dstlen - off)) {
+            dst[dstlen - 1] = '\0';
+            return;
+        }
+        off += (size_t)written;
+    }
+}
+
+static void build_csv_diag(char *dst, size_t dstlen, const int *values, size_t count) {
+    if (!dst || dstlen == 0) return;
+
+    dst[0] = '\0';
+    size_t off = 0;
+    for (size_t i = 0; i < count && off < dstlen; ++i) {
+        int written = snprintf(dst + off,
+                               dstlen - off,
+                               (i == 0) ? "%02d" : ",%02d",
+                               values[i]);
+        if (written < 0) {
+            dst[0] = '\0';
+            return;
+        }
+        if ((size_t)written >= (dstlen - off)) {
+            dst[dstlen - 1] = '\0';
+            return;
+        }
+        off += (size_t)written;
+    }
+}
 
 // ----------------- WiFi hard off (libera netifs, etc.) -----------------
 static void wifi_hard_off(void) {
@@ -93,8 +138,6 @@ static void build_city_hyphen(char *dst, size_t dstlen, const char *city, const 
 
 // ----------------- TASK DE SENSORES + HOSTINGER (PPP) -----------------
 static void sensor_task(void *pv) {
-    //SensorData data;
-
     // Hora de arranque (inicio) para JSON de primer envío
     time_t start_epoch;
     struct tm start_tm_info;
@@ -109,19 +152,19 @@ static void sensor_task(void *pv) {
 
     // Ya no se realiza borrado al arranque.
 
-    const TickType_t SAMPLE_DELAY_TICKS = pdMS_TO_TICKS(60000);
+    const TickType_t SAMPLE_DELAY_TICKS = pdMS_TO_TICKS(SAMPLE_DELAY_MS);
 
-    int batch_slot = 0;
+    int minute_sample_slot = 0;
+    uint16_t scd41_co2_raw_1m[SAMPLES_PER_MINUTE] = {0};
+    int scd41_diag_raw_1m[SAMPLES_PER_MINUTE] = {0};
+    int sen55_diag_raw_1m[SAMPLES_PER_MINUTE] = {0};
 
-    // SCD41: siempre guardamos 5 slots, válidos o no
-    uint16_t scd41_co2_vals[BATCH_SLOTS] = {0};
-    int scd41_diag_vals[BATCH_SLOTS] = {0};
     uint32_t sum_co2 = 0;
-    int scd41_valid_count = 0;
+    int scd41_ok_count_1m = 0;
+    int scd41_err03_count_1m = 0;
+    int scd41_zero_count_1m = 0;
+    uint16_t scd41_co2_last_raw = 0;
 
-    // SEN55: también guardamos 5 códigos de diagnóstico,
-    // pero solo promediamos lecturas válidas
-    int sen55_diag_vals[BATCH_SLOTS] = {0};
     int sen55_valid_count = 0;
 
     double sum_pm1p0    = 0;
@@ -156,20 +199,27 @@ static void sensor_task(void *pv) {
         // ----------------- SCD41 -----------------
         esp_err_t scd_ret = sensors_read_scd41(&data);
         int scd_diag = sensors_get_last_scd41_diag();
+        scd41_co2_raw_1m[minute_sample_slot] = data.co2;
+        scd41_diag_raw_1m[minute_sample_slot] = scd_diag;
+        scd41_co2_last_raw = data.co2;
 
-        // Guardar siempre el valor recibido, aunque venga con error 03
-        scd41_co2_vals[batch_slot] = data.co2;
-        scd41_diag_vals[batch_slot] = scd_diag;
-
-        // Solo usarlo para el promedio si fue lectura válida
         if (scd_ret == ESP_OK) {
             sum_co2 += data.co2;
-            scd41_valid_count++;
+            scd41_ok_count_1m++;
+        }
+
+        if (scd_diag == SENSOR_DIAG_OUT_OF_RANGE) {
+            scd41_err03_count_1m++;
+        }
+
+        if (data.co2 == 0) {
+            scd41_zero_count_1m++;
         }
 
         // ----------------- SEN55 -----------------
         esp_err_t sen_ret = sensors_read_sen55(&data);
         int sen_diag = sensors_get_last_sen55_diag();
+        sen55_diag_raw_1m[minute_sample_slot] = sen_diag;
 
         if (sen_ret == ESP_OK) {
             sum_pm1p0    += data.pm1p0;
@@ -182,24 +232,68 @@ static void sensor_task(void *pv) {
             sum_avg_hum  += data.avg_hum;
             sen55_valid_count++;
         }
-        sen55_diag_vals[batch_slot] = sen_diag;
 
     #if LOG_EACH_SAMPLE
         ESP_LOGI(TAG_APP,
-            "Slot %d/5 | SCD41: co2=%u diag=%02d ret=%s | SEN55: diag=%02d ret=%s",
-            batch_slot + 1,
-            scd41_co2_vals[batch_slot],
-            scd41_diag_vals[batch_slot],
+            "Muestra %d/%d | SCD41: co2_raw=%u diag=%02d ret=%s | SEN55: diag=%02d ret=%s",
+            minute_sample_slot + 1,
+            SAMPLES_PER_MINUTE,
+            data.co2,
+            scd_diag,
             esp_err_to_name(scd_ret),
-            sen55_diag_vals[batch_slot],
+            sen_diag,
             esp_err_to_name(sen_ret));
     #endif
 
-        batch_slot++;
+        minute_sample_slot++;
 
-        // Enviamos cada 5 intentos exactos
-        if (batch_slot >= BATCH_SLOTS) {
-            // Timestamp actual
+        if (minute_sample_slot >= SAMPLES_PER_MINUTE) {
+            SensorData minute_avg = (SensorData){0};
+            char scd41_co2_raw_csv[96];
+            char scd41_diag_raw_csv[48];
+            char sen55_diag_raw_csv[48];
+
+            if (scd41_ok_count_1m > 0) {
+                minute_avg.co2 = (uint16_t)(sum_co2 / scd41_ok_count_1m);
+            }
+
+            if (sen55_valid_count > 0) {
+                double denom = (double)sen55_valid_count;
+                minute_avg.pm1p0    = (float)(sum_pm1p0    / denom);
+                minute_avg.pm2p5    = (float)(sum_pm2p5    / denom);
+                minute_avg.pm4p0    = (float)(sum_pm4p0    / denom);
+                minute_avg.pm10p0   = (float)(sum_pm10p0   / denom);
+                minute_avg.voc      = (float)(sum_voc      / denom);
+                minute_avg.nox      = (float)(sum_nox      / denom);
+                minute_avg.avg_temp = (float)(sum_avg_temp / denom);
+                minute_avg.avg_hum  = (float)(sum_avg_hum  / denom);
+                minute_avg.scd_temp = minute_avg.avg_temp;
+                minute_avg.scd_hum  = minute_avg.avg_hum;
+                minute_avg.sen_temp = minute_avg.avg_temp;
+                minute_avg.sen_hum  = minute_avg.avg_hum;
+            }
+
+            build_csv_u16(scd41_co2_raw_csv,
+                          sizeof(scd41_co2_raw_csv),
+                          scd41_co2_raw_1m,
+                          SAMPLES_PER_MINUTE);
+            build_csv_diag(scd41_diag_raw_csv,
+                           sizeof(scd41_diag_raw_csv),
+                           scd41_diag_raw_1m,
+                           SAMPLES_PER_MINUTE);
+            build_csv_diag(sen55_diag_raw_csv,
+                           sizeof(sen55_diag_raw_csv),
+                           sen55_diag_raw_1m,
+                           SAMPLES_PER_MINUTE);
+
+            ESP_LOGI(TAG_APP,
+                     "Resumen 1m | co2=%u scd41_ok=%d scd41_err03=%d scd41_zero=%d scd41_last_raw=%u",
+                     minute_avg.co2,
+                     scd41_ok_count_1m,
+                     scd41_err03_count_1m,
+                     scd41_zero_count_1m,
+                     scd41_co2_last_raw);
+
             time_t now_epoch;
             struct tm tm_info;
             time(&now_epoch);
@@ -211,107 +305,56 @@ static void sensor_task(void *pv) {
             char fecha_actual[20];
             strftime(fecha_actual, sizeof(fecha_actual), "%d-%m-%Y", &tm_info);
 
-            // Promedios
-            SensorData avg = (SensorData){0};
-
-            if (scd41_valid_count > 0) {
-                avg.co2 = (uint16_t)(sum_co2 / scd41_valid_count);
-            } else {
-                avg.co2 = 0;
-            }
-
-            if (sen55_valid_count > 0) {
-                double denom = (double)sen55_valid_count;
-                avg.pm1p0    = (float)(sum_pm1p0    / denom);
-                avg.pm2p5    = (float)(sum_pm2p5    / denom);
-                avg.pm4p0    = (float)(sum_pm4p0    / denom);
-                avg.pm10p0   = (float)(sum_pm10p0   / denom);
-                avg.voc      = (float)(sum_voc      / denom);
-                avg.nox      = (float)(sum_nox      / denom);
-                avg.avg_temp = (float)(sum_avg_temp / denom);
-                avg.avg_hum  = (float)(sum_avg_hum  / denom);
-
-                avg.scd_temp = avg.avg_temp;
-                avg.scd_hum  = avg.avg_hum;
-                avg.sen_temp = avg.avg_temp;
-                avg.sen_hum  = avg.avg_hum;
-            }
-
-            // Strings de debug
-            char scd41_co2_str[64];
-            char scd41_diag_str[32];
-            char sen55_diag_str[32];
-            int off = 0;
-
-            scd41_co2_str[0] = '\0';
-            scd41_diag_str[0] = '\0';
-            sen55_diag_str[0] = '\0';
-
-            off = 0;
-            for (int i = 0; i < BATCH_SLOTS; ++i) {
-                off += snprintf(scd41_co2_str + off,
-                                sizeof(scd41_co2_str) - off,
-                                (i == 0) ? "%u" : ",%u",
-                                scd41_co2_vals[i]);
-                if (off >= (int)sizeof(scd41_co2_str)) break;
-            }
-
-            off = 0;
-            for (int i = 0; i < BATCH_SLOTS; ++i) {
-                off += snprintf(scd41_diag_str + off,
-                                sizeof(scd41_diag_str) - off,
-                                (i == 0) ? "%02d" : ",%02d",
-                                scd41_diag_vals[i]);
-                if (off >= (int)sizeof(scd41_diag_str)) break;
-            }
-
-            off = 0;
-            for (int i = 0; i < BATCH_SLOTS; ++i) {
-                off += snprintf(sen55_diag_str + off,
-                                sizeof(sen55_diag_str) - off,
-                                (i == 0) ? "%02d" : ",%02d",
-                                sen55_diag_vals[i]);
-                if (off >= (int)sizeof(sen55_diag_str)) break;
-            }
-
-            char json[640];
+            char json[1024];
 
             bool include_fecha = first_send ||
                                 (strncmp(last_fecha_str, fecha_actual,
-                                        sizeof(last_fecha_str)) != 0);
+                                         sizeof(last_fecha_str)) != 0);
 
             if (first_send) {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
-                    "\"scd41_co2\":\"%s\",\"scd41_diag\":\"%s\",\"sen55_diag\":\"%s\","
+                    "\"scd41_co2_raw_1m\":\"%s\",\"scd41_diag_raw_1m\":\"%s\",\"sen55_diag_raw_1m\":\"%s\","
+                    "\"scd41_ok_count_1m\":%d,\"scd41_err03_count_1m\":%d,\"scd41_zero_count_1m\":%d,"
+                    "\"scd41_co2_last_raw\":%u,"
                     "\"fecha\":\"%s\",\"inicio\":\"%s\",\"ciudad\":\"%s\",\"hora\":\"%s\","
                     "\"device_id\":\"%s\"}",
-                    avg.pm1p0, avg.pm2p5, avg.pm4p0, avg.pm10p0,
-                    avg.voc, avg.nox, avg.avg_temp, avg.avg_hum, avg.co2,
-                    scd41_co2_str, scd41_diag_str, sen55_diag_str,
+                    minute_avg.pm1p0, minute_avg.pm2p5, minute_avg.pm4p0, minute_avg.pm10p0,
+                    minute_avg.voc, minute_avg.nox, minute_avg.avg_temp, minute_avg.avg_hum, minute_avg.co2,
+                    scd41_co2_raw_csv, scd41_diag_raw_csv, sen55_diag_raw_csv,
+                    scd41_ok_count_1m, scd41_err03_count_1m, scd41_zero_count_1m,
+                    scd41_co2_last_raw,
                     fecha_actual, inicio_str, g_city, hora_envio, DEVICE_ID);
 
             } else if (include_fecha) {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
-                    "\"scd41_co2\":\"%s\",\"scd41_diag\":\"%s\",\"sen55_diag\":\"%s\","
+                    "\"scd41_co2_raw_1m\":\"%s\",\"scd41_diag_raw_1m\":\"%s\",\"sen55_diag_raw_1m\":\"%s\","
+                    "\"scd41_ok_count_1m\":%d,\"scd41_err03_count_1m\":%d,\"scd41_zero_count_1m\":%d,"
+                    "\"scd41_co2_last_raw\":%u,"
                     "\"fecha\":\"%s\",\"hora\":\"%s\"}",
-                    avg.pm1p0, avg.pm2p5, avg.pm4p0, avg.pm10p0,
-                    avg.voc, avg.nox, avg.avg_temp, avg.avg_hum, avg.co2,
-                    scd41_co2_str, scd41_diag_str, sen55_diag_str,
+                    minute_avg.pm1p0, minute_avg.pm2p5, minute_avg.pm4p0, minute_avg.pm10p0,
+                    minute_avg.voc, minute_avg.nox, minute_avg.avg_temp, minute_avg.avg_hum, minute_avg.co2,
+                    scd41_co2_raw_csv, scd41_diag_raw_csv, sen55_diag_raw_csv,
+                    scd41_ok_count_1m, scd41_err03_count_1m, scd41_zero_count_1m,
+                    scd41_co2_last_raw,
                     fecha_actual, hora_envio);
 
             } else {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
-                    "\"scd41_co2\":\"%s\",\"scd41_diag\":\"%s\",\"sen55_diag\":\"%s\","
+                    "\"scd41_co2_raw_1m\":\"%s\",\"scd41_diag_raw_1m\":\"%s\",\"sen55_diag_raw_1m\":\"%s\","
+                    "\"scd41_ok_count_1m\":%d,\"scd41_err03_count_1m\":%d,\"scd41_zero_count_1m\":%d,"
+                    "\"scd41_co2_last_raw\":%u,"
                     "\"hora\":\"%s\"}",
-                    avg.pm1p0, avg.pm2p5, avg.pm4p0, avg.pm10p0,
-                    avg.voc, avg.nox, avg.avg_temp, avg.avg_hum, avg.co2,
-                    scd41_co2_str, scd41_diag_str, sen55_diag_str,
+                    minute_avg.pm1p0, minute_avg.pm2p5, minute_avg.pm4p0, minute_avg.pm10p0,
+                    minute_avg.voc, minute_avg.nox, minute_avg.avg_temp, minute_avg.avg_hum, minute_avg.co2,
+                    scd41_co2_raw_csv, scd41_diag_raw_csv, sen55_diag_raw_csv,
+                    scd41_ok_count_1m, scd41_err03_count_1m, scd41_zero_count_1m,
+                    scd41_co2_last_raw,
                     hora_envio);
             }
 
@@ -355,17 +398,16 @@ static void sensor_task(void *pv) {
             }
             first_send = false;
 
-            // Reset del batch
-            batch_slot = 0;
-
-            memset(scd41_co2_vals, 0, sizeof(scd41_co2_vals));
-            memset(scd41_diag_vals, 0, sizeof(scd41_diag_vals));
-            memset(sen55_diag_vals, 0, sizeof(sen55_diag_vals));
-
+            minute_sample_slot = 0;
+            memset(scd41_co2_raw_1m, 0, sizeof(scd41_co2_raw_1m));
+            memset(scd41_diag_raw_1m, 0, sizeof(scd41_diag_raw_1m));
+            memset(sen55_diag_raw_1m, 0, sizeof(sen55_diag_raw_1m));
             sum_co2 = 0;
-            scd41_valid_count = 0;
+            scd41_ok_count_1m = 0;
+            scd41_err03_count_1m = 0;
+            scd41_zero_count_1m = 0;
+            scd41_co2_last_raw = 0;
             sen55_valid_count = 0;
-
             sum_pm1p0 = sum_pm2p5 = sum_pm4p0 = sum_pm10p0 = 0;
             sum_voc   = sum_nox   = sum_avg_temp = sum_avg_hum = 0;
         }
@@ -388,6 +430,8 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    ESP_LOGI(TAG_APP, "Version local firmware: %s", app_desc->version);
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -441,13 +485,17 @@ void app_main(void)
         }
     } else {
         ESP_LOGW(TAG_APP,
-                 "UNWIREDLABS_TOKEN vacío. Ciudad quedará '----'");
-        sensors_set_city_state("----");
+                 "UNWIREDLABS_TOKEN vacío. Ciudad quedará 'Morelos'");
+        sensors_set_city_state("Morelos");
     }
 
     vTaskDelay(pdMS_TO_TICKS(1500));
 
-    // === 4) Sensores y task de envío a Hostinger (ya SIN Firebase) ===
+    // === 4) Verificacion  de actulizacion de firmware ===
+    ESP_LOGI(TAG_APP, "SNTP listo; revisando OTA por HTTPS");
+    ota_check_and_update_if_needed();
+
+    // === 5) Sensores y task de envío a Hostinger (ya SIN Firebase) ===
     esp_err_t sret = sensors_init_all();
     if (sret != ESP_OK) {
         ESP_LOGE(TAG_APP, "Fallo al inicializar sensores: %s",
