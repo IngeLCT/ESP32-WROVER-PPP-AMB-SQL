@@ -41,51 +41,7 @@ static char g_city[64]  = "----";
 #define HOSTINGER_POST_MAX_RETRIES 3
 #define HOSTINGER_POST_RETRY_DELAY_MS 2000
 #define SAMPLE_DELAY_MS 5000
-#define SAMPLES_PER_MINUTE 12
-
-static void build_csv_u16(char *dst, size_t dstlen, const uint16_t *values, size_t count) {
-    if (!dst || dstlen == 0) return;
-
-    dst[0] = '\0';
-    size_t off = 0;
-    for (size_t i = 0; i < count && off < dstlen; ++i) {
-        int written = snprintf(dst + off,
-                               dstlen - off,
-                               (i == 0) ? "%u" : ",%u",
-                               values[i]);
-        if (written < 0) {
-            dst[0] = '\0';
-            return;
-        }
-        if ((size_t)written >= (dstlen - off)) {
-            dst[dstlen - 1] = '\0';
-            return;
-        }
-        off += (size_t)written;
-    }
-}
-
-static void build_csv_diag(char *dst, size_t dstlen, const int *values, size_t count) {
-    if (!dst || dstlen == 0) return;
-
-    dst[0] = '\0';
-    size_t off = 0;
-    for (size_t i = 0; i < count && off < dstlen; ++i) {
-        int written = snprintf(dst + off,
-                               dstlen - off,
-                               (i == 0) ? "%02d" : ",%02d",
-                               values[i]);
-        if (written < 0) {
-            dst[0] = '\0';
-            return;
-        }
-        if ((size_t)written >= (dstlen - off)) {
-            dst[dstlen - 1] = '\0';
-            return;
-        }
-        off += (size_t)written;
-    }
-}
+#define SAMPLES_PER_SEND_WINDOW 60
 
 // ----------------- WiFi hard off (libera netifs, etc.) -----------------
 static void wifi_hard_off(void) {
@@ -154,18 +110,13 @@ static void sensor_task(void *pv) {
 
     const TickType_t SAMPLE_DELAY_TICKS = pdMS_TO_TICKS(SAMPLE_DELAY_MS);
 
-    int minute_sample_slot = 0;
-    uint16_t scd41_co2_raw_1m[SAMPLES_PER_MINUTE] = {0};
-    int scd41_diag_raw_1m[SAMPLES_PER_MINUTE] = {0};
-    int sen55_diag_raw_1m[SAMPLES_PER_MINUTE] = {0};
-
+    int sample_slot = 0;
     uint32_t sum_co2 = 0;
-    int scd41_ok_count_1m = 0;
-    int scd41_err03_count_1m = 0;
-    int scd41_zero_count_1m = 0;
-    uint16_t scd41_co2_last_raw = 0;
+    int scd41_ok_count_5m = 0;
+    int scd41_err03_count_5m = 0;
+    int scd41_zero_count_5m = 0;
 
-    int sen55_valid_count = 0;
+    int sen55_valid_count_5m = 0;
 
     double sum_pm1p0    = 0;
     double sum_pm2p5    = 0;
@@ -199,27 +150,23 @@ static void sensor_task(void *pv) {
         // ----------------- SCD41 -----------------
         esp_err_t scd_ret = sensors_read_scd41(&data);
         int scd_diag = sensors_get_last_scd41_diag();
-        scd41_co2_raw_1m[minute_sample_slot] = data.co2;
-        scd41_diag_raw_1m[minute_sample_slot] = scd_diag;
-        scd41_co2_last_raw = data.co2;
 
         if (scd_ret == ESP_OK) {
             sum_co2 += data.co2;
-            scd41_ok_count_1m++;
+            scd41_ok_count_5m++;
         }
 
         if (scd_diag == SENSOR_DIAG_OUT_OF_RANGE) {
-            scd41_err03_count_1m++;
+            scd41_err03_count_5m++;
         }
 
         if (data.co2 == 0) {
-            scd41_zero_count_1m++;
+            scd41_zero_count_5m++;
         }
 
         // ----------------- SEN55 -----------------
         esp_err_t sen_ret = sensors_read_sen55(&data);
         int sen_diag = sensors_get_last_sen55_diag();
-        sen55_diag_raw_1m[minute_sample_slot] = sen_diag;
 
         if (sen_ret == ESP_OK) {
             sum_pm1p0    += data.pm1p0;
@@ -230,14 +177,14 @@ static void sensor_task(void *pv) {
             sum_nox      += data.nox;
             sum_avg_temp += data.avg_temp;
             sum_avg_hum  += data.avg_hum;
-            sen55_valid_count++;
+            sen55_valid_count_5m++;
         }
 
     #if LOG_EACH_SAMPLE
         ESP_LOGI(TAG_APP,
-            "Muestra %d/%d | SCD41: co2_raw=%u diag=%02d ret=%s | SEN55: diag=%02d ret=%s",
-            minute_sample_slot + 1,
-            SAMPLES_PER_MINUTE,
+            "Muestra %d/%d de 5m | SCD41: co2_raw=%u diag=%02d ret=%s | SEN55: diag=%02d ret=%s",
+            sample_slot + 1,
+            SAMPLES_PER_SEND_WINDOW,
             data.co2,
             scd_diag,
             esp_err_to_name(scd_ret),
@@ -245,54 +192,37 @@ static void sensor_task(void *pv) {
             esp_err_to_name(sen_ret));
     #endif
 
-        minute_sample_slot++;
+        sample_slot++;
 
-        if (minute_sample_slot >= SAMPLES_PER_MINUTE) {
-            SensorData minute_avg = (SensorData){0};
-            char scd41_co2_raw_csv[96];
-            char scd41_diag_raw_csv[48];
-            char sen55_diag_raw_csv[48];
+        if (sample_slot >= SAMPLES_PER_SEND_WINDOW) {
+            SensorData window_avg = (SensorData){0};
 
-            if (scd41_ok_count_1m > 0) {
-                minute_avg.co2 = (uint16_t)(sum_co2 / scd41_ok_count_1m);
+            if (scd41_ok_count_5m > 0) {
+                window_avg.co2 = (uint16_t)(sum_co2 / scd41_ok_count_5m);
             }
 
-            if (sen55_valid_count > 0) {
-                double denom = (double)sen55_valid_count;
-                minute_avg.pm1p0    = (float)(sum_pm1p0    / denom);
-                minute_avg.pm2p5    = (float)(sum_pm2p5    / denom);
-                minute_avg.pm4p0    = (float)(sum_pm4p0    / denom);
-                minute_avg.pm10p0   = (float)(sum_pm10p0   / denom);
-                minute_avg.voc      = (float)(sum_voc      / denom);
-                minute_avg.nox      = (float)(sum_nox      / denom);
-                minute_avg.avg_temp = (float)(sum_avg_temp / denom);
-                minute_avg.avg_hum  = (float)(sum_avg_hum  / denom);
-                minute_avg.scd_temp = minute_avg.avg_temp;
-                minute_avg.scd_hum  = minute_avg.avg_hum;
-                minute_avg.sen_temp = minute_avg.avg_temp;
-                minute_avg.sen_hum  = minute_avg.avg_hum;
+            if (sen55_valid_count_5m > 0) {
+                double denom = (double)sen55_valid_count_5m;
+                window_avg.pm1p0    = (float)(sum_pm1p0    / denom);
+                window_avg.pm2p5    = (float)(sum_pm2p5    / denom);
+                window_avg.pm4p0    = (float)(sum_pm4p0    / denom);
+                window_avg.pm10p0   = (float)(sum_pm10p0   / denom);
+                window_avg.voc      = (float)(sum_voc      / denom);
+                window_avg.nox      = (float)(sum_nox      / denom);
+                window_avg.avg_temp = (float)(sum_avg_temp / denom);
+                window_avg.avg_hum  = (float)(sum_avg_hum  / denom);
+                window_avg.scd_temp = window_avg.avg_temp;
+                window_avg.scd_hum  = window_avg.avg_hum;
+                window_avg.sen_temp = window_avg.avg_temp;
+                window_avg.sen_hum  = window_avg.avg_hum;
             }
-
-            build_csv_u16(scd41_co2_raw_csv,
-                          sizeof(scd41_co2_raw_csv),
-                          scd41_co2_raw_1m,
-                          SAMPLES_PER_MINUTE);
-            build_csv_diag(scd41_diag_raw_csv,
-                           sizeof(scd41_diag_raw_csv),
-                           scd41_diag_raw_1m,
-                           SAMPLES_PER_MINUTE);
-            build_csv_diag(sen55_diag_raw_csv,
-                           sizeof(sen55_diag_raw_csv),
-                           sen55_diag_raw_1m,
-                           SAMPLES_PER_MINUTE);
 
             ESP_LOGI(TAG_APP,
-                     "Resumen 1m | co2=%u scd41_ok=%d scd41_err03=%d scd41_zero=%d scd41_last_raw=%u",
-                     minute_avg.co2,
-                     scd41_ok_count_1m,
-                     scd41_err03_count_1m,
-                     scd41_zero_count_1m,
-                     scd41_co2_last_raw);
+                     "Resumen 5m | co2=%u scd41_ok=%d scd41_err03=%d scd41_zero=%d",
+                     window_avg.co2,
+                     scd41_ok_count_5m,
+                     scd41_err03_count_5m,
+                     scd41_zero_count_5m);
 
             time_t now_epoch;
             struct tm tm_info;
@@ -305,7 +235,7 @@ static void sensor_task(void *pv) {
             char fecha_actual[20];
             strftime(fecha_actual, sizeof(fecha_actual), "%d-%m-%Y", &tm_info);
 
-            char json[1024];
+            char json[768];
 
             bool include_fecha = first_send ||
                                 (strncmp(last_fecha_str, fecha_actual,
@@ -315,46 +245,34 @@ static void sensor_task(void *pv) {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
-                    "\"scd41_co2_raw_1m\":\"%s\",\"scd41_diag_raw_1m\":\"%s\",\"sen55_diag_raw_1m\":\"%s\","
-                    "\"scd41_ok_count_1m\":%d,\"scd41_err03_count_1m\":%d,\"scd41_zero_count_1m\":%d,"
-                    "\"scd41_co2_last_raw\":%u,"
+                    "\"scd41_ok_count_5m\":%d,\"scd41_err03_count_5m\":%d,\"scd41_zero_count_5m\":%d,"
                     "\"fecha\":\"%s\",\"inicio\":\"%s\",\"ciudad\":\"%s\",\"hora\":\"%s\","
                     "\"device_id\":\"%s\"}",
-                    minute_avg.pm1p0, minute_avg.pm2p5, minute_avg.pm4p0, minute_avg.pm10p0,
-                    minute_avg.voc, minute_avg.nox, minute_avg.avg_temp, minute_avg.avg_hum, minute_avg.co2,
-                    scd41_co2_raw_csv, scd41_diag_raw_csv, sen55_diag_raw_csv,
-                    scd41_ok_count_1m, scd41_err03_count_1m, scd41_zero_count_1m,
-                    scd41_co2_last_raw,
+                    window_avg.pm1p0, window_avg.pm2p5, window_avg.pm4p0, window_avg.pm10p0,
+                    window_avg.voc, window_avg.nox, window_avg.avg_temp, window_avg.avg_hum, window_avg.co2,
+                    scd41_ok_count_5m, scd41_err03_count_5m, scd41_zero_count_5m,
                     fecha_actual, inicio_str, g_city, hora_envio, DEVICE_ID);
 
             } else if (include_fecha) {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
-                    "\"scd41_co2_raw_1m\":\"%s\",\"scd41_diag_raw_1m\":\"%s\",\"sen55_diag_raw_1m\":\"%s\","
-                    "\"scd41_ok_count_1m\":%d,\"scd41_err03_count_1m\":%d,\"scd41_zero_count_1m\":%d,"
-                    "\"scd41_co2_last_raw\":%u,"
+                    "\"scd41_ok_count_5m\":%d,\"scd41_err03_count_5m\":%d,\"scd41_zero_count_5m\":%d,"
                     "\"fecha\":\"%s\",\"hora\":\"%s\"}",
-                    minute_avg.pm1p0, minute_avg.pm2p5, minute_avg.pm4p0, minute_avg.pm10p0,
-                    minute_avg.voc, minute_avg.nox, minute_avg.avg_temp, minute_avg.avg_hum, minute_avg.co2,
-                    scd41_co2_raw_csv, scd41_diag_raw_csv, sen55_diag_raw_csv,
-                    scd41_ok_count_1m, scd41_err03_count_1m, scd41_zero_count_1m,
-                    scd41_co2_last_raw,
+                    window_avg.pm1p0, window_avg.pm2p5, window_avg.pm4p0, window_avg.pm10p0,
+                    window_avg.voc, window_avg.nox, window_avg.avg_temp, window_avg.avg_hum, window_avg.co2,
+                    scd41_ok_count_5m, scd41_err03_count_5m, scd41_zero_count_5m,
                     fecha_actual, hora_envio);
 
             } else {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
-                    "\"scd41_co2_raw_1m\":\"%s\",\"scd41_diag_raw_1m\":\"%s\",\"sen55_diag_raw_1m\":\"%s\","
-                    "\"scd41_ok_count_1m\":%d,\"scd41_err03_count_1m\":%d,\"scd41_zero_count_1m\":%d,"
-                    "\"scd41_co2_last_raw\":%u,"
+                    "\"scd41_ok_count_5m\":%d,\"scd41_err03_count_5m\":%d,\"scd41_zero_count_5m\":%d,"
                     "\"hora\":\"%s\"}",
-                    minute_avg.pm1p0, minute_avg.pm2p5, minute_avg.pm4p0, minute_avg.pm10p0,
-                    minute_avg.voc, minute_avg.nox, minute_avg.avg_temp, minute_avg.avg_hum, minute_avg.co2,
-                    scd41_co2_raw_csv, scd41_diag_raw_csv, sen55_diag_raw_csv,
-                    scd41_ok_count_1m, scd41_err03_count_1m, scd41_zero_count_1m,
-                    scd41_co2_last_raw,
+                    window_avg.pm1p0, window_avg.pm2p5, window_avg.pm4p0, window_avg.pm10p0,
+                    window_avg.voc, window_avg.nox, window_avg.avg_temp, window_avg.avg_hum, window_avg.co2,
+                    scd41_ok_count_5m, scd41_err03_count_5m, scd41_zero_count_5m,
                     hora_envio);
             }
 
@@ -398,16 +316,12 @@ static void sensor_task(void *pv) {
             }
             first_send = false;
 
-            minute_sample_slot = 0;
-            memset(scd41_co2_raw_1m, 0, sizeof(scd41_co2_raw_1m));
-            memset(scd41_diag_raw_1m, 0, sizeof(scd41_diag_raw_1m));
-            memset(sen55_diag_raw_1m, 0, sizeof(sen55_diag_raw_1m));
+            sample_slot = 0;
             sum_co2 = 0;
-            scd41_ok_count_1m = 0;
-            scd41_err03_count_1m = 0;
-            scd41_zero_count_1m = 0;
-            scd41_co2_last_raw = 0;
-            sen55_valid_count = 0;
+            scd41_ok_count_5m = 0;
+            scd41_err03_count_5m = 0;
+            scd41_zero_count_5m = 0;
+            sen55_valid_count_5m = 0;
             sum_pm1p0 = sum_pm2p5 = sum_pm4p0 = sum_pm10p0 = 0;
             sum_voc   = sum_nox   = sum_avg_temp = sum_avg_hum = 0;
         }
