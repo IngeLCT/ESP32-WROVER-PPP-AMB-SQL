@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS    "sensors.c" "main.c" "modem_ppp.c" "ota_update.c"
+    SRCS    "sensors.c" "main.c" "modem_ppp.c" "ota_update.c" "geo_cache.c"
     INCLUDE_DIRS "." 
     REQUIRES 
         esp_hostinger

@@ -42,6 +42,13 @@ bool modem_get_ue_info(modem_ue_info_t *out);
 esp_err_t modem_unwiredlabs_city_state(char *city, size_t city_len,
                                        char *state, size_t state_len);
 
+/** Variante de intento unico para control externo de reintentos.
+ *  Si detecta rate limit, deja *rate_limited=true.
+ */
+esp_err_t modem_unwiredlabs_city_state_once(char *city, size_t city_len,
+                                            char *state, size_t state_len,
+                                            bool *rate_limited);
+
 /** Estado y reconexión de PPP */
 bool modem_ppp_is_connected(void);
 bool modem_ppp_reconnect_blocking(uint32_t window_ms);

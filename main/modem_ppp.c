@@ -303,6 +303,141 @@ static bool json_get_string(const char *json, const char *key, char *out, size_t
     return true;
 }
 
+static bool contains_ignore_case(const char *text, const char *needle) {
+    if (!text || !needle || !needle[0]) return false;
+
+    size_t needle_len = strlen(needle);
+    for (const char *p = text; *p; ++p) {
+        size_t i = 0;
+        while (i < needle_len &&
+               p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) {
+            ++i;
+        }
+        if (i == needle_len) return true;
+    }
+    return false;
+}
+
+static bool ul_response_indicates_rate_limit(int status, const char *body) {
+    if (status == 429) return true;
+    if (!body || !body[0]) return false;
+
+    return contains_ignore_case(body, "too many") ||
+           contains_ignore_case(body, "rate limit") ||
+           contains_ignore_case(body, "daily limit") ||
+           contains_ignore_case(body, "usage limit") ||
+           contains_ignore_case(body, "limit reached") ||
+           contains_ignore_case(body, "quota") ||
+           contains_ignore_case(body, "\"balance\":0") ||
+           contains_ignore_case(body, "no credits") ||
+           contains_ignore_case(body, "credits left");
+}
+
+esp_err_t modem_unwiredlabs_city_state_once(char *city, size_t city_len,
+                                            char *state, size_t state_len,
+                                            bool *rate_limited)
+{
+    if (city && city_len)  city[0]  = '\0';
+    if (state && state_len) state[0] = '\0';
+    if (rate_limited) *rate_limited = false;
+
+    if (!s_ue_valid) {
+        ESP_LOGW(TAG, "UE info inválida; ejecuta CPSI primero");
+        return ESP_FAIL;
+    }
+    if (UNWIREDLABS_TOKEN[0] == '\0') {
+        ESP_LOGE(TAG, "UNWIREDLABS_TOKEN vacío (defínelo en privado.h)");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char payload[256];
+    int plen = snprintf(payload, sizeof(payload),
+        "{\"token\":\"%s\",\"radio\":\"lte\",\"mcc\":%d,\"mnc\":%d,"
+        "\"cells\":[{\"lac\":%u,\"cid\":%u}],\"address\":2}",
+        UNWIREDLABS_TOKEN, s_ue_info.mcc, s_ue_info.mnc,
+        (unsigned)s_ue_info.tac, (unsigned)s_ue_info.cell_id);
+    if (plen <= 0 || plen >= (int)sizeof(payload)) {
+        ESP_LOGW(TAG, "payload truncado");
+        return ESP_FAIL;
+    }
+
+    memset(ul_body, 0, sizeof(ul_body));
+    ul_accum_t acc = { .buf = ul_body, .max = UL_BODY_MAX, .len = 0 };
+
+    heap_caps_check_integrity_all(true);
+    force_public_dns();
+
+    struct ifreq ifr = {0};
+    if (s_ppp_netif) {
+        esp_netif_get_netif_impl_name(s_ppp_netif, ifr.ifr_name);
+    }
+
+    esp_http_client_config_t cfg = {
+        .url = UNWIRED_URL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 20000,
+        .event_handler = ul_http_evt,
+        .user_data = &acc,
+        .buffer_size = 2048,
+        .buffer_size_tx = 1024,
+        .method = HTTP_METHOD_POST,
+        .if_name = s_ppp_netif ? &ifr : NULL
+    };
+
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (!cli) {
+        ESP_LOGW(TAG, "no client");
+        return ESP_FAIL;
+    }
+
+    esp_http_client_set_header(cli, "Content-Type", "application/json");
+    esp_http_client_set_post_field(cli, payload, plen);
+
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t err = esp_http_client_perform(cli);
+    int64_t t1 = esp_timer_get_time();
+
+    int status = esp_http_client_get_status_code(cli);
+    int cl = esp_http_client_get_content_length(cli);
+    ESP_LOGI(TAG, "UL intento unico HTTP %d cl=%d t=%lld ms len=%d",
+             status, cl, (long long)((t1 - t0) / 1000), acc.len);
+
+    esp_http_client_cleanup(cli);
+
+    if (ul_response_indicates_rate_limit(status, ul_body)) {
+        if (rate_limited) *rate_limited = true;
+        ESP_LOGW(TAG, "UnwiredLabs reportó rate limit o cuota agotada");
+        return ESP_FAIL;
+    }
+
+    if (err == ESP_OK && status == 200 && acc.len > 0) {
+        char api_status[8] = "";
+        (void)json_get_string(ul_body, "status", api_status, sizeof(api_status));
+        if (strcasecmp(api_status, "ok") != 0) {
+            ESP_LOGW(TAG, "API status no OK ('%s')", api_status);
+            return ESP_FAIL;
+        }
+
+        const char *addr = strstr(ul_body, "\"address\"");
+        if (!addr) addr = strstr(ul_body, "\"address_detail\"");
+        if (!addr) addr = ul_body;
+
+        (void)json_get_string(addr, "city",  city,  city_len);
+        (void)json_get_string(addr, "state", state, state_len);
+
+        if ((city && city[0]) || (state && state[0])) {
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG, "Sin address.city/state en respuesta");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGW(TAG, "HTTP fallo %s", esp_err_to_name(err));
+    return err != ESP_OK ? err : ESP_FAIL;
+}
+
 /* POST a UL usando s_ue_info. Solo city/state, sin fecha/hora. */
 esp_err_t modem_unwiredlabs_city_state(char *city, size_t city_len,
                                        char *state, size_t state_len)
@@ -319,95 +454,17 @@ esp_err_t modem_unwiredlabs_city_state(char *city, size_t city_len,
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* UL usa 'lac' para TAC/LAC y 'cid' para ECI/CID. address=2 pide address_detail */
-    char payload[256];
-    int plen = snprintf(payload, sizeof(payload),
-        "{\"token\":\"%s\",\"radio\":\"lte\",\"mcc\":%d,\"mnc\":%d,"
-        "\"cells\":[{\"lac\":%u,\"cid\":%u}],\"address\":2}",
-        UNWIREDLABS_TOKEN, s_ue_info.mcc, s_ue_info.mnc,
-        (unsigned)s_ue_info.tac, (unsigned)s_ue_info.cell_id);
-    if (plen <= 0 || plen >= (int)sizeof(payload)) {
-        ESP_LOGW(TAG, "payload truncado");
-        return ESP_FAIL;
-    }
-
     const int MAX_ATTEMPTS = 5;
     esp_err_t last_err = ESP_FAIL;
 
     for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
         ESP_LOGI(TAG, "UL intento %d/%d", attempt, MAX_ATTEMPTS);
-
-        /* Acumulador estilo Geoapify */
-        memset(ul_body, 0, sizeof(ul_body));
-        ul_accum_t acc = { .buf = ul_body, .max = UL_BODY_MAX, .len = 0 };
-
-        /* Checkpoint de integridad de heap ANTES del init del client */
-        heap_caps_check_integrity_all(true);
-
-        force_public_dns();  // asegúrate de llamarla aquí
-
-        struct ifreq ifr = {0};
-        if (s_ppp_netif) {
-            esp_netif_get_netif_impl_name(s_ppp_netif, ifr.ifr_name);
-        }
-
-        esp_http_client_config_t cfg = {
-            .url = UNWIRED_URL,                     // igual que tu ejemplo Geoapify
-            .crt_bundle_attach = esp_crt_bundle_attach,
-            .timeout_ms = 20000,
-            .event_handler = ul_http_evt,
-            .user_data = &acc,
-            .buffer_size = 2048,
-            .buffer_size_tx = 1024,
-            .method = HTTP_METHOD_POST,
-            .if_name = s_ppp_netif ? &ifr : NULL  // <<--- liga a PPP
-        };
-
-        esp_http_client_handle_t cli = esp_http_client_init(&cfg);
-        if (!cli) {
-            ESP_LOGW(TAG, "no client");
-            vTaskDelay(pdMS_TO_TICKS(1000 * attempt));
-            continue;
-        }
-
-        esp_http_client_set_header(cli, "Content-Type", "application/json");
-        esp_http_client_set_post_field(cli, payload, plen);
-
-        int64_t t0 = esp_timer_get_time();
-        esp_err_t err = esp_http_client_perform(cli);
-        int64_t t1 = esp_timer_get_time();
-
-        int status = esp_http_client_get_status_code(cli);
-        int cl = esp_http_client_get_content_length(cli);
-        ESP_LOGI(TAG, "HTTP %d cl=%d t=%lld ms len=%d",
-                 status, cl, (long long)((t1-t0)/1000), acc.len);
-
-        last_err = err;
-        esp_http_client_cleanup(cli);
-
-        if (err == ESP_OK && status == 200 && acc.len > 0) {
-            /* Verifica "status":"ok" */
-            char api_status[8] = "";
-            (void)json_get_string(ul_body, "status", api_status, sizeof(api_status));
-            if (strcasecmp(api_status, "ok") != 0) {
-                ESP_LOGW(TAG, "API status no OK ('%s')", api_status);
-            } else {
-                /* city/state: a veces en "address" o en "address_detail" */
-                const char *addr = strstr(ul_body, "\"address\"");
-                if (!addr) addr = strstr(ul_body, "\"address_detail\"");
-                if (!addr) addr = ul_body;
-
-                (void)json_get_string(addr, "city",  city,  city_len);
-                (void)json_get_string(addr, "state", state, state_len);
-
-                if ((city && city[0]) || (state && state[0])) {
-                    return ESP_OK;
-                }
-                ESP_LOGW(TAG, "Sin address.city/state en respuesta");
-            }
-        } else {
-            ESP_LOGW(TAG, "HTTP fallo %s", esp_err_to_name(err));
-        }
+        bool rate_limited = false;
+        last_err = modem_unwiredlabs_city_state_once(city, city_len,
+                                                     state, state_len,
+                                                     &rate_limited);
+        if (last_err == ESP_OK) return ESP_OK;
+        if (rate_limited) return last_err ? last_err : ESP_FAIL;
 
         vTaskDelay(pdMS_TO_TICKS(500 * attempt)); // backoff suave
     }

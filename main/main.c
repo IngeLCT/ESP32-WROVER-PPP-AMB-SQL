@@ -14,6 +14,7 @@
 
 // Project
 #include "Privado.h"
+#include "geo_cache.h"
 #include "sensors.h"
 #include "hostinger_ingest.h"
 #include "ota_update.h"
@@ -42,6 +43,20 @@ static char g_city[64]  = "----";
 #define HOSTINGER_POST_RETRY_DELAY_MS 2000
 #define SAMPLE_DELAY_MS 5000
 #define SAMPLES_PER_SEND_WINDOW 60
+
+static void apply_city_to_runtime(const char *city_value) {
+    const char *resolved_city = (city_value && city_value[0]) ? city_value : "----";
+    strlcpy(g_city, resolved_city, sizeof(g_city));
+    sensors_set_city_state(g_city);
+}
+
+static void apply_cached_city_or_default(const geo_cache_state_t *geo_state,
+                                         const char *reason) {
+    const char *cached_city = (geo_state && geo_state->last_city[0]) ?
+                              geo_state->last_city : "----";
+    ESP_LOGI(TAG_APP, "%s. Usando ciudad cacheada: %s", reason, cached_city);
+    apply_city_to_runtime(cached_city);
+}
 
 // ----------------- WiFi hard off (libera netifs, etc.) -----------------
 static void wifi_hard_off(void) {
@@ -124,6 +139,8 @@ static void sensor_task(void *pv) {
     double sum_pm10p0   = 0;
     double sum_voc      = 0;
     double sum_nox      = 0;
+    double sum_sen_temp = 0;
+    double sum_sen_hum  = 0;
     double sum_avg_temp = 0;
     double sum_avg_hum  = 0;
 
@@ -175,6 +192,8 @@ static void sensor_task(void *pv) {
             sum_pm10p0   += data.pm10p0;
             sum_voc      += data.voc;
             sum_nox      += data.nox;
+            sum_sen_temp += data.sen_temp;
+            sum_sen_hum  += data.sen_hum;
             sum_avg_temp += data.avg_temp;
             sum_avg_hum  += data.avg_hum;
             sen55_valid_count_5m++;
@@ -209,20 +228,22 @@ static void sensor_task(void *pv) {
                 window_avg.pm10p0   = (float)(sum_pm10p0   / denom);
                 window_avg.voc      = (float)(sum_voc      / denom);
                 window_avg.nox      = (float)(sum_nox      / denom);
+                window_avg.sen_temp = (float)(sum_sen_temp / denom);
+                window_avg.sen_hum  = (float)(sum_sen_hum  / denom);
                 window_avg.avg_temp = (float)(sum_avg_temp / denom);
                 window_avg.avg_hum  = (float)(sum_avg_hum  / denom);
                 window_avg.scd_temp = window_avg.avg_temp;
                 window_avg.scd_hum  = window_avg.avg_hum;
-                window_avg.sen_temp = window_avg.avg_temp;
-                window_avg.sen_hum  = window_avg.avg_hum;
             }
 
             ESP_LOGI(TAG_APP,
-                     "Resumen 5m | co2=%u scd41_ok=%d scd41_err03=%d scd41_zero=%d",
+                     "Resumen 5m | co2=%u scd41_ok=%d scd41_err03=%d scd41_zero=%d sen55_temp_dbg=%.2f sen55_hum_dbg=%.2f",
                      window_avg.co2,
                      scd41_ok_count_5m,
                      scd41_err03_count_5m,
-                     scd41_zero_count_5m);
+                     scd41_zero_count_5m,
+                     window_avg.sen_temp,
+                     window_avg.sen_hum);
 
             time_t now_epoch;
             struct tm tm_info;
@@ -235,21 +256,38 @@ static void sensor_task(void *pv) {
             char fecha_actual[20];
             strftime(fecha_actual, sizeof(fecha_actual), "%d-%m-%Y", &tm_info);
 
-            char json[768];
+            char json[896];
 
             bool include_fecha = first_send ||
                                 (strncmp(last_fecha_str, fecha_actual,
                                          sizeof(last_fecha_str)) != 0);
+            bool day_changed = (!first_send && include_fecha);
+
+            if (day_changed) {
+                esp_err_t geo_reset_err = geo_cache_reset_daily_flags();
+                if (geo_reset_err == ESP_OK) {
+                    ESP_LOGI(TAG_APP,
+                             "Cambio de dia detectado (%s). Reset de flags diarios de geolocalizacion",
+                             fecha_actual);
+                } else {
+                    ESP_LOGW(TAG_APP,
+                             "Cambio de dia detectado (%s), pero no se pudieron resetear flags geo: %s",
+                             fecha_actual,
+                             esp_err_to_name(geo_reset_err));
+                }
+            }
 
             if (first_send) {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
+                    "\"sen55_temp_dbg\":%.2f,\"sen55_hum_dbg\":%.2f,"
                     "\"scd41_ok_count_5m\":%d,\"scd41_err03_count_5m\":%d,\"scd41_zero_count_5m\":%d,"
                     "\"fecha\":\"%s\",\"inicio\":\"%s\",\"ciudad\":\"%s\",\"hora\":\"%s\","
                     "\"device_id\":\"%s\"}",
                     window_avg.pm1p0, window_avg.pm2p5, window_avg.pm4p0, window_avg.pm10p0,
                     window_avg.voc, window_avg.nox, window_avg.avg_temp, window_avg.avg_hum, window_avg.co2,
+                    window_avg.sen_temp, window_avg.sen_hum,
                     scd41_ok_count_5m, scd41_err03_count_5m, scd41_zero_count_5m,
                     fecha_actual, inicio_str, g_city, hora_envio, DEVICE_ID);
 
@@ -257,10 +295,12 @@ static void sensor_task(void *pv) {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
+                    "\"sen55_temp_dbg\":%.2f,\"sen55_hum_dbg\":%.2f,"
                     "\"scd41_ok_count_5m\":%d,\"scd41_err03_count_5m\":%d,\"scd41_zero_count_5m\":%d,"
                     "\"fecha\":\"%s\",\"hora\":\"%s\"}",
                     window_avg.pm1p0, window_avg.pm2p5, window_avg.pm4p0, window_avg.pm10p0,
                     window_avg.voc, window_avg.nox, window_avg.avg_temp, window_avg.avg_hum, window_avg.co2,
+                    window_avg.sen_temp, window_avg.sen_hum,
                     scd41_ok_count_5m, scd41_err03_count_5m, scd41_zero_count_5m,
                     fecha_actual, hora_envio);
 
@@ -268,10 +308,12 @@ static void sensor_task(void *pv) {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
+                    "\"sen55_temp_dbg\":%.2f,\"sen55_hum_dbg\":%.2f,"
                     "\"scd41_ok_count_5m\":%d,\"scd41_err03_count_5m\":%d,\"scd41_zero_count_5m\":%d,"
                     "\"hora\":\"%s\"}",
                     window_avg.pm1p0, window_avg.pm2p5, window_avg.pm4p0, window_avg.pm10p0,
                     window_avg.voc, window_avg.nox, window_avg.avg_temp, window_avg.avg_hum, window_avg.co2,
+                    window_avg.sen_temp, window_avg.sen_hum,
                     scd41_ok_count_5m, scd41_err03_count_5m, scd41_zero_count_5m,
                     hora_envio);
             }
@@ -323,7 +365,8 @@ static void sensor_task(void *pv) {
             scd41_zero_count_5m = 0;
             sen55_valid_count_5m = 0;
             sum_pm1p0 = sum_pm2p5 = sum_pm4p0 = sum_pm10p0 = 0;
-            sum_voc   = sum_nox   = sum_avg_temp = sum_avg_hum = 0;
+            sum_voc   = sum_nox   = sum_sen_temp = sum_sen_hum = 0;
+            sum_avg_temp = sum_avg_hum = 0;
         }
 
         vTaskDelay(SAMPLE_DELAY_TICKS);
@@ -382,25 +425,72 @@ void app_main(void)
     // === 2) SNTP con PPP activo ===
     init_sntp_and_time();
 
+    geo_cache_state_t geo_state = {0};
+    esp_err_t geo_cache_err = geo_cache_load(&geo_state);
+    if (geo_cache_err != ESP_OK) {
+        ESP_LOGW(TAG_APP, "No se pudo cargar cache geo desde NVS: %s",
+                 esp_err_to_name(geo_cache_err));
+    }
+    ESP_LOGI(TAG_APP,
+             "Geo flags NVS | attempt_done_today=%d rate_limited_today=%d last_city='%s'",
+             geo_state.geo_attempt_done_today,
+             geo_state.geo_rate_limited_today,
+             geo_state.last_city[0] ? geo_state.last_city : "");
+
     // === 3) Geolocalización por celda (AT + UnwiredLabs) => g_city sin comas ===
-    if (UNWIREDLABS_TOKEN[0]) {
+    if (!UNWIREDLABS_TOKEN[0]) {
+        ESP_LOGW(TAG_APP, "UNWIREDLABS_TOKEN vacio. No se consultara UnwiredLabs");
+        apply_cached_city_or_default(&geo_state, "Geolocalizacion omitida por token vacio");
+    } else if (geo_state.geo_rate_limited_today) {
+        ESP_LOGW(TAG_APP, "Geolocalizacion bloqueada por flag diario de rate limit");
+        apply_cached_city_or_default(&geo_state, "Rate limit ya detectado hoy");
+    } else if (geo_state.geo_attempt_done_today) {
+        ESP_LOGI(TAG_APP, "Geolocalizacion bloqueada por flag diario: ya hubo intento hoy");
+        apply_cached_city_or_default(&geo_state, "Intento diario ya realizado");
+    } else {
         char city[64]  = "";
         char state[64] = "";
-        if (modem_unwiredlabs_city_state(city, sizeof(city),
-                                         state, sizeof(state)) == ESP_OK) {
+        bool rate_limited = false;
+
+        ESP_LOGI(TAG_APP, "Intento unico de geolocalizacion del dia");
+        esp_err_t geo_err = modem_unwiredlabs_city_state_once(city, sizeof(city),
+                                                              state, sizeof(state),
+                                                              &rate_limited);
+        if (geo_err == ESP_OK) {
             build_city_hyphen(g_city, sizeof(g_city), city, state); // "Ciudad-Estado"
-            ESP_LOGI(TAG_APP, "Ciudad para JSON (1a vez): %s", g_city);
-            sensors_set_city_state(g_city);
+            ESP_LOGI(TAG_APP, "Geolocalizacion exitosa. Ciudad para JSON: %s", g_city);
+            apply_city_to_runtime(g_city);
+
+            esp_err_t save_city_err = geo_cache_store_last_city(g_city);
+            if (save_city_err != ESP_OK) {
+                ESP_LOGW(TAG_APP, "No se pudo guardar last_city en NVS: %s",
+                         esp_err_to_name(save_city_err));
+            }
+
+            esp_err_t save_flags_err = geo_cache_set_daily_flags(true, false);
+            if (save_flags_err != ESP_OK) {
+                ESP_LOGW(TAG_APP, "No se pudieron guardar flags geo de exito: %s",
+                         esp_err_to_name(save_flags_err));
+            }
+        } else if (rate_limited) {
+            ESP_LOGW(TAG_APP, "Rate limit detectado en UnwiredLabs. No se volvera a intentar hoy");
+            esp_err_t save_flags_err = geo_cache_set_daily_flags(true, true);
+            if (save_flags_err != ESP_OK) {
+                ESP_LOGW(TAG_APP, "No se pudieron guardar flags geo de rate limit: %s",
+                         esp_err_to_name(save_flags_err));
+            }
+            apply_cached_city_or_default(&geo_state, "Rate limit detectado");
         } else {
             ESP_LOGW(TAG_APP,
-                     "No se pudo geolocalizar por celda. Usaré ciudad='----'");
-            strlcpy(g_city, "----", sizeof(g_city));
-            sensors_set_city_state(g_city);
+                     "Fallo geolocalizacion por celda: %s",
+                     esp_err_to_name(geo_err));
+            esp_err_t save_flags_err = geo_cache_set_daily_flags(true, false);
+            if (save_flags_err != ESP_OK) {
+                ESP_LOGW(TAG_APP, "No se pudieron guardar flags geo de fallo: %s",
+                         esp_err_to_name(save_flags_err));
+            }
+            apply_cached_city_or_default(&geo_state, "Fallo de geolocalizacion del dia");
         }
-    } else {
-        ESP_LOGW(TAG_APP,
-                 "UNWIREDLABS_TOKEN vacío. Ciudad quedará 'Morelos'");
-        sensors_set_city_state("Morelos");
     }
 
     vTaskDelay(pdMS_TO_TICKS(1500));
