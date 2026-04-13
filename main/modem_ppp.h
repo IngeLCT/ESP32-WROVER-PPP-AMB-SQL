@@ -53,6 +53,15 @@ esp_err_t modem_unwiredlabs_city_state_once(char *city, size_t city_len,
 bool modem_ppp_is_connected(void);
 bool modem_ppp_reconnect_blocking(uint32_t window_ms);
 
+/** Fuerza DNS publicos en LWIP y en la interfaz PPP activa. */
+void modem_ppp_force_public_dns(void);
+
+/** Prueba resolucion DNS via getaddrinfo y loguea el resultado. */
+esp_err_t modem_ppp_dns_probe(const char *hostname);
+
+/** Prueba los hosts criticos del flujo PPP/HTTPS. */
+esp_err_t modem_ppp_dns_probe_many(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -20,6 +20,7 @@
 #include "lwip/inet.h"              // ipaddr_addr
 #include "lwip/dns.h"          // dns_setserver
 #include "lwip/netdb.h"        // getaddrinfo (si haces pruebas)
+#include "lwip/sockets.h"
 #include "esp_modem_api.h"
 
 /* ==== HTTP (UnwiredLabs) ==== */
@@ -246,7 +247,7 @@ bool modem_get_ue_info(modem_ue_info_t *out)
     return s_ue_valid;
 }
 
-static void force_public_dns(void) {
+void modem_ppp_force_public_dns(void) {
     // Ajusta ambos: global (LWIP) y por interfaz (esp-netif)
     ip_addr_t dns;
     IP_ADDR4(&dns, 1, 1, 1, 1);
@@ -262,6 +263,64 @@ static void force_public_dns(void) {
         d2.ip.u_addr.ip4.addr = ipaddr_addr("8.8.8.8");
         esp_netif_set_dns_info(s_ppp_netif, ESP_NETIF_DNS_BACKUP, &d2);
     }
+}
+
+esp_err_t modem_ppp_dns_probe(const char *hostname) {
+    if (!hostname || !hostname[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_LOGI(TAG, "Probando DNS para %s", hostname);
+
+    struct addrinfo hints = {
+        .ai_family = AF_UNSPEC,
+        .ai_socktype = SOCK_STREAM,
+    };
+    struct addrinfo *res = NULL;
+
+    int rc = getaddrinfo(hostname, NULL, &hints, &res);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "DNS FAIL: %s -> getaddrinfo=%d", hostname, rc);
+        return ESP_FAIL;
+    }
+
+    char addr_str[64] = "";
+    for (struct addrinfo *it = res; it; it = it->ai_next) {
+        void *addr = NULL;
+        if (it->ai_family == AF_INET) {
+            struct sockaddr_in *sa = (struct sockaddr_in *)it->ai_addr;
+            addr = &sa->sin_addr;
+        }
+#if LWIP_IPV6
+        else if (it->ai_family == AF_INET6) {
+            struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)it->ai_addr;
+            addr = &sa6->sin6_addr;
+        }
+#endif
+
+        if (addr && inet_ntop(it->ai_family, addr, addr_str, sizeof(addr_str))) {
+            ESP_LOGI(TAG, "DNS OK: %s -> %s", hostname, addr_str);
+            freeaddrinfo(res);
+            return ESP_OK;
+        }
+    }
+
+    ESP_LOGW(TAG, "DNS FAIL: %s -> sin direccion IP util", hostname);
+    freeaddrinfo(res);
+    return ESP_FAIL;
+}
+
+esp_err_t modem_ppp_dns_probe_many(void) {
+    esp_err_t ret = ESP_OK;
+
+    if (modem_ppp_dns_probe("pool.ntp.org") != ESP_OK) {
+        ret = ESP_FAIL;
+    }
+    if (modem_ppp_dns_probe("ambiental-lct.ecosensor.com.mx") != ESP_OK) {
+        ret = ESP_FAIL;
+    }
+
+    return ret;
 }
 
 
@@ -366,7 +425,6 @@ esp_err_t modem_unwiredlabs_city_state_once(char *city, size_t city_len,
     ul_accum_t acc = { .buf = ul_body, .max = UL_BODY_MAX, .len = 0 };
 
     heap_caps_check_integrity_all(true);
-    force_public_dns();
 
     struct ifreq ifr = {0};
     if (s_ppp_netif) {

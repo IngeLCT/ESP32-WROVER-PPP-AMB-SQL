@@ -43,6 +43,9 @@ static char g_city[64]  = "----";
 #define HOSTINGER_POST_RETRY_DELAY_MS 2000
 #define SAMPLE_DELAY_MS 5000
 #define SAMPLES_PER_SEND_WINDOW 60
+#define SNTP_TIME_VALID_EPOCH 1609459200  // 2021-01-01 00:00:00 UTC
+#define SNTP_SYNC_TIMEOUT_MS 60000
+#define SNTP_SYNC_POLL_MS 500
 
 static void apply_city_to_runtime(const char *city_value) {
     const char *resolved_city = (city_value && city_value[0]) ? city_value : "----";
@@ -72,7 +75,15 @@ static void wifi_hard_off(void) {
 }
 
 // ----------------- SNTP / Hora -----------------
-static void init_sntp_and_time(void) {
+static bool system_time_is_valid(void) {
+    time_t now = 0;
+    time(&now);
+    return now > SNTP_TIME_VALID_EPOCH;
+}
+
+static bool init_sntp_and_time(void) {
+    ESP_LOGI(TAG_APP, "Iniciando SNTP");
+
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
@@ -81,15 +92,31 @@ static void init_sntp_and_time(void) {
     // Zona horaria GMT-6 (ajusta si usas horario de verano distinto)
     setenv("TZ", "UTC6", 1);
     tzset();
-    
 
-    // Espera a tener una fecha razonable (> 2021-01-01)
-    for (int i = 0; i < 100; ++i) {
-        time_t now = 0;
-        time(&now);
-        if (now > 1609459200) break; // ~2021-01-01
-        vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG_APP, "Esperando sincronizacion SNTP hasta %d ms",
+             SNTP_SYNC_TIMEOUT_MS);
+
+    const int max_polls = SNTP_SYNC_TIMEOUT_MS / SNTP_SYNC_POLL_MS;
+    for (int i = 0; i < max_polls; ++i) {
+        if (system_time_is_valid()) {
+            time_t now = 0;
+            struct tm tm_info;
+            char time_str[32];
+            time(&now);
+            localtime_r(&now, &tm_info);
+            strftime(time_str, sizeof(time_str), "%d-%m-%Y %H:%M:%S", &tm_info);
+            ESP_LOGI(TAG_APP, "SNTP listo; hora valida obtenida: %s", time_str);
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(SNTP_SYNC_POLL_MS));
     }
+
+    time_t now = 0;
+    time(&now);
+    ESP_LOGW(TAG_APP,
+             "Timeout SNTP: hora del sistema sigue invalida (epoch=%lld)",
+             (long long)now);
+    return false;
 }
 
 /* Construye "Ciudad-Estado" sin comas (para CSV / Hostinger), con saneo básico */
@@ -159,6 +186,8 @@ static void sensor_task(void *pv) {
                 vTaskDelay(pdMS_TO_TICKS(PPP_BACKOFF_IDLE_MS));
                 continue;
             }
+            modem_ppp_force_public_dns();
+            ESP_LOGI(TAG_APP, "DNS publicos reaplicados tras reconectar PPP");
             ESP_LOGI(TAG_APP, "PPP reconectado; reanudo medición/envío");
         }
 
@@ -422,8 +451,13 @@ void app_main(void)
         esp_restart();
     }
 
-    // === 2) SNTP con PPP activo ===
-    init_sntp_and_time();
+    // === 2) DNS publicos con PPP activo ===
+    modem_ppp_force_public_dns();
+    ESP_LOGI(TAG_APP, "DNS publicos aplicados tras PPP");
+    (void)modem_ppp_dns_probe_many();
+
+    // === 3) SNTP con PPP activo ===
+    bool sntp_time_valid = init_sntp_and_time();
 
     geo_cache_state_t geo_state = {0};
     esp_err_t geo_cache_err = geo_cache_load(&geo_state);
@@ -437,7 +471,7 @@ void app_main(void)
              geo_state.geo_rate_limited_today,
              geo_state.last_city[0] ? geo_state.last_city : "");
 
-    // === 3) Geolocalización por celda (AT + UnwiredLabs) => g_city sin comas ===
+    // === 4) Geolocalizacion por celda (AT + UnwiredLabs) => g_city sin comas ===
     if (!UNWIREDLABS_TOKEN[0]) {
         ESP_LOGW(TAG_APP, "UNWIREDLABS_TOKEN vacio. No se consultara UnwiredLabs");
         apply_cached_city_or_default(&geo_state, "Geolocalizacion omitida por token vacio");
@@ -495,11 +529,16 @@ void app_main(void)
 
     vTaskDelay(pdMS_TO_TICKS(1500));
 
-    // === 4) Verificacion  de actulizacion de firmware ===
-    ESP_LOGI(TAG_APP, "SNTP listo; revisando OTA por HTTPS");
-    ota_check_and_update_if_needed();
+    // === 5) Verificacion de actualizacion de firmware ===
+    if (sntp_time_valid) {
+        ESP_LOGI(TAG_APP, "Hora valida; revisando OTA por HTTPS");
+        ota_check_and_update_if_needed();
+    } else {
+        ESP_LOGW(TAG_APP,
+                 "OTA omitida en este arranque: hora del sistema no validada");
+    }
 
-    // === 5) Sensores y task de envío a Hostinger (ya SIN Firebase) ===
+    // === 6) Sensores y task de envio a Hostinger (ya SIN Firebase) ===
     esp_err_t sret = sensors_init_all();
     if (sret != ESP_OK) {
         ESP_LOGE(TAG_APP, "Fallo al inicializar sensores: %s",
@@ -513,3 +552,4 @@ void app_main(void)
                     NULL);
     }
 }
+
