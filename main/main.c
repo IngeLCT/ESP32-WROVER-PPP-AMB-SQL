@@ -46,6 +46,21 @@ static char g_city[64]  = "----";
 #define SNTP_TIME_VALID_EPOCH 1609459200  // 2021-01-01 00:00:00 UTC
 #define SNTP_SYNC_TIMEOUT_MS 60000
 #define SNTP_SYNC_POLL_MS 500
+#define GEO_MAX_ATTEMPTS_PER_DAY 2
+#define GEO_RETRY_AFTER_DNS_MS  (30 * 60 * 1000)
+#define GEO_RETRY_AFTER_FAIL_MS (12 * 60 * 60 * 1000)
+#define GEO_DNS_HOST "us2.unwiredlabs.com"
+
+typedef enum {
+    GEO_TRY_OK = 0,
+    GEO_TRY_RATE_LIMIT,
+    GEO_TRY_DNS_NOT_READY,
+    GEO_TRY_FAIL_OTHER
+} geo_try_result_t;
+
+static int64_t monotonic_ms(void) {
+    return esp_timer_get_time() / 1000;
+}
 
 static void apply_city_to_runtime(const char *city_value) {
     const char *resolved_city = (city_value && city_value[0]) ? city_value : "----";
@@ -59,6 +74,25 @@ static void apply_cached_city_or_default(const geo_cache_state_t *geo_state,
                               geo_state->last_city : "----";
     ESP_LOGI(TAG_APP, "%s. Usando ciudad cacheada: %s", reason, cached_city);
     apply_city_to_runtime(cached_city);
+}
+
+static geo_try_result_t geo_try_once(char *city, size_t city_len,
+                                     char *state, size_t state_len) {
+    if (modem_ppp_dns_probe(GEO_DNS_HOST) != ESP_OK) {
+        return GEO_TRY_DNS_NOT_READY;
+    }
+
+    bool rate_limited = false;
+    esp_err_t geo_err = modem_unwiredlabs_city_state_once(city, city_len,
+                                                           state, state_len,
+                                                           &rate_limited);
+    if (geo_err == ESP_OK) {
+        return GEO_TRY_OK;
+    }
+    if (rate_limited) {
+        return GEO_TRY_RATE_LIMIT;
+    }
+    return GEO_TRY_FAIL_OTHER;
 }
 
 // ----------------- WiFi hard off (libera netifs, etc.) -----------------
@@ -172,6 +206,20 @@ static void sensor_task(void *pv) {
     double sum_avg_hum  = 0;
 
     char last_fecha_str[20] = "";
+    geo_cache_state_t geo_state = {0};
+    int64_t next_geo_retry_ms = 0;
+
+    esp_err_t geo_cache_err = geo_cache_load(&geo_state);
+    if (geo_cache_err != ESP_OK) {
+        ESP_LOGW(TAG_APP, "No se pudo cargar estado geo en sensor_task: %s",
+                 esp_err_to_name(geo_cache_err));
+    }
+    ESP_LOGI(TAG_APP,
+             "Geo estado inicial | success_today=%d rate_limited_today=%d attempts=%u last_city='%s'",
+             geo_state.geo_success_today,
+             geo_state.geo_rate_limited_today,
+             geo_state.geo_attempt_count_today,
+             geo_state.last_city[0] ? geo_state.last_city : "");
 
     while (1) {
 
@@ -292,20 +340,6 @@ static void sensor_task(void *pv) {
                                          sizeof(last_fecha_str)) != 0);
             bool day_changed = (!first_send && include_fecha);
 
-            if (day_changed) {
-                esp_err_t geo_reset_err = geo_cache_reset_daily_flags();
-                if (geo_reset_err == ESP_OK) {
-                    ESP_LOGI(TAG_APP,
-                             "Cambio de dia detectado (%s). Reset de flags diarios de geolocalizacion",
-                             fecha_actual);
-                } else {
-                    ESP_LOGW(TAG_APP,
-                             "Cambio de dia detectado (%s), pero no se pudieron resetear flags geo: %s",
-                             fecha_actual,
-                             esp_err_to_name(geo_reset_err));
-                }
-            }
-
             if (first_send) {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
@@ -379,6 +413,121 @@ static void sensor_task(void *pv) {
                         HOSTINGER_POST_MAX_RETRIES);
                 vTaskDelay(pdMS_TO_TICKS(HOSTINGER_POST_RETRY_DELAY_MS));
                 esp_restart();
+            }
+
+            if (day_changed) {
+                esp_err_t geo_reset_err = geo_cache_reset_daily_state();
+                if (geo_reset_err == ESP_OK) {
+                    geo_state.geo_success_today = false;
+                    geo_state.geo_rate_limited_today = false;
+                    geo_state.geo_attempt_count_today = 0;
+                    next_geo_retry_ms = 0;
+                    ESP_LOGI(TAG_APP,
+                             "Cambio de dia detectado (%s). Estado geo diario reiniciado",
+                             fecha_actual);
+                } else {
+                    ESP_LOGW(TAG_APP,
+                             "Cambio de dia detectado (%s), pero no se pudo reiniciar estado geo: %s",
+                             fecha_actual,
+                             esp_err_to_name(geo_reset_err));
+                }
+
+                if (system_time_is_valid()) {
+                    ESP_LOGI(TAG_APP,
+                             "Cambio de dia detectado (%s). Verificacion OTA diaria",
+                             fecha_actual);
+                    modem_ppp_force_public_dns();
+                    ota_check_and_update_if_needed();
+                } else {
+                    ESP_LOGW(TAG_APP,
+                             "Cambio de dia detectado (%s), pero la hora no es valida. OTA diaria omitida",
+                             fecha_actual);
+                }
+            }
+
+            if (UNWIREDLABS_TOKEN[0]) {
+                int64_t now_ms = monotonic_ms();
+                bool should_try_geo = false;
+
+                if (geo_state.geo_success_today) {
+                    ESP_LOGI(TAG_APP, "Geo: ya hubo exito hoy, no se reintenta");
+                } else if (geo_state.geo_rate_limited_today) {
+                    ESP_LOGI(TAG_APP, "Geo: bloqueado hoy por rate limit");
+                } else if (geo_state.geo_attempt_count_today >= GEO_MAX_ATTEMPTS_PER_DAY) {
+                    ESP_LOGI(TAG_APP, "Geo: maximo diario de intentos alcanzado (%u)",
+                             geo_state.geo_attempt_count_today);
+                } else if (next_geo_retry_ms > now_ms) {
+                    int64_t remaining_ms = next_geo_retry_ms - now_ms;
+                    ESP_LOGI(TAG_APP,
+                             "Geo: reintento aun no corresponde, faltan %lld s",
+                             (long long)(remaining_ms / 1000));
+                } else {
+                    should_try_geo = true;
+                }
+
+                if (should_try_geo) {
+                    char city[64] = "";
+                    char state[64] = "";
+                    ESP_LOGI(TAG_APP, "Geo: intentando geolocalizacion post-envio");
+                    geo_try_result_t geo_result = geo_try_once(city, sizeof(city),
+                                                               state, sizeof(state));
+
+                    if (geo_result == GEO_TRY_DNS_NOT_READY) {
+                        next_geo_retry_ms = now_ms + GEO_RETRY_AFTER_DNS_MS;
+                        ESP_LOGW(TAG_APP,
+                                 "Geo: DNS no listo, no consume intento. Reintento en %d min",
+                                 GEO_RETRY_AFTER_DNS_MS / 60000);
+                    } else if (geo_result == GEO_TRY_OK) {
+                        build_city_hyphen(g_city, sizeof(g_city), city, state);
+                        apply_city_to_runtime(g_city);
+
+                        geo_state.geo_attempt_count_today++;
+                        geo_state.geo_success_today = true;
+                        geo_state.geo_rate_limited_today = false;
+                        next_geo_retry_ms = 0;
+
+                        (void)geo_cache_store_last_city(g_city);
+                        (void)geo_cache_set_daily_state(geo_state.geo_success_today,
+                                                        geo_state.geo_rate_limited_today,
+                                                        geo_state.geo_attempt_count_today);
+                        ESP_LOGI(TAG_APP,
+                                 "Geo: exito, ciudad actualizada a %s (attempts=%u)",
+                                 g_city,
+                                 geo_state.geo_attempt_count_today);
+                    } else if (geo_result == GEO_TRY_RATE_LIMIT) {
+                        geo_state.geo_attempt_count_today++;
+                        geo_state.geo_success_today = false;
+                        geo_state.geo_rate_limited_today = true;
+                        next_geo_retry_ms = 0;
+
+                        (void)geo_cache_set_daily_state(geo_state.geo_success_today,
+                                                        geo_state.geo_rate_limited_today,
+                                                        geo_state.geo_attempt_count_today);
+                        ESP_LOGW(TAG_APP,
+                                 "Geo: rate limit detectado, se bloquea resto del dia (attempts=%u)",
+                                 geo_state.geo_attempt_count_today);
+                    } else {
+                        geo_state.geo_attempt_count_today++;
+                        geo_state.geo_success_today = false;
+                        geo_state.geo_rate_limited_today = false;
+
+                        (void)geo_cache_set_daily_state(geo_state.geo_success_today,
+                                                        geo_state.geo_rate_limited_today,
+                                                        geo_state.geo_attempt_count_today);
+
+                        if (geo_state.geo_attempt_count_today < GEO_MAX_ATTEMPTS_PER_DAY) {
+                            next_geo_retry_ms = now_ms + GEO_RETRY_AFTER_FAIL_MS;
+                            ESP_LOGW(TAG_APP,
+                                     "Geo: fallo no-DNS, intento consumido. Reintento en %d h",
+                                     GEO_RETRY_AFTER_FAIL_MS / (60 * 60 * 1000));
+                        } else {
+                            next_geo_retry_ms = 0;
+                            ESP_LOGW(TAG_APP,
+                                     "Geo: fallo no-DNS y se alcanzo maximo diario (%u)",
+                                     geo_state.geo_attempt_count_today);
+                        }
+                    }
+                }
             }
 
             if (include_fecha) {
@@ -466,66 +615,13 @@ void app_main(void)
                  esp_err_to_name(geo_cache_err));
     }
     ESP_LOGI(TAG_APP,
-             "Geo flags NVS | attempt_done_today=%d rate_limited_today=%d last_city='%s'",
-             geo_state.geo_attempt_done_today,
+             "Geo cache NVS | success_today=%d rate_limited_today=%d attempts=%u last_city='%s'",
+             geo_state.geo_success_today,
              geo_state.geo_rate_limited_today,
+             geo_state.geo_attempt_count_today,
              geo_state.last_city[0] ? geo_state.last_city : "");
-
-    // === 4) Geolocalizacion por celda (AT + UnwiredLabs) => g_city sin comas ===
-    if (!UNWIREDLABS_TOKEN[0]) {
-        ESP_LOGW(TAG_APP, "UNWIREDLABS_TOKEN vacio. No se consultara UnwiredLabs");
-        apply_cached_city_or_default(&geo_state, "Geolocalizacion omitida por token vacio");
-    } else if (geo_state.geo_rate_limited_today) {
-        ESP_LOGW(TAG_APP, "Geolocalizacion bloqueada por flag diario de rate limit");
-        apply_cached_city_or_default(&geo_state, "Rate limit ya detectado hoy");
-    } else if (geo_state.geo_attempt_done_today) {
-        ESP_LOGI(TAG_APP, "Geolocalizacion bloqueada por flag diario: ya hubo intento hoy");
-        apply_cached_city_or_default(&geo_state, "Intento diario ya realizado");
-    } else {
-        char city[64]  = "";
-        char state[64] = "";
-        bool rate_limited = false;
-
-        ESP_LOGI(TAG_APP, "Intento unico de geolocalizacion del dia");
-        esp_err_t geo_err = modem_unwiredlabs_city_state_once(city, sizeof(city),
-                                                              state, sizeof(state),
-                                                              &rate_limited);
-        if (geo_err == ESP_OK) {
-            build_city_hyphen(g_city, sizeof(g_city), city, state); // "Ciudad-Estado"
-            ESP_LOGI(TAG_APP, "Geolocalizacion exitosa. Ciudad para JSON: %s", g_city);
-            apply_city_to_runtime(g_city);
-
-            esp_err_t save_city_err = geo_cache_store_last_city(g_city);
-            if (save_city_err != ESP_OK) {
-                ESP_LOGW(TAG_APP, "No se pudo guardar last_city en NVS: %s",
-                         esp_err_to_name(save_city_err));
-            }
-
-            esp_err_t save_flags_err = geo_cache_set_daily_flags(true, false);
-            if (save_flags_err != ESP_OK) {
-                ESP_LOGW(TAG_APP, "No se pudieron guardar flags geo de exito: %s",
-                         esp_err_to_name(save_flags_err));
-            }
-        } else if (rate_limited) {
-            ESP_LOGW(TAG_APP, "Rate limit detectado en UnwiredLabs. No se volvera a intentar hoy");
-            esp_err_t save_flags_err = geo_cache_set_daily_flags(true, true);
-            if (save_flags_err != ESP_OK) {
-                ESP_LOGW(TAG_APP, "No se pudieron guardar flags geo de rate limit: %s",
-                         esp_err_to_name(save_flags_err));
-            }
-            apply_cached_city_or_default(&geo_state, "Rate limit detectado");
-        } else {
-            ESP_LOGW(TAG_APP,
-                     "Fallo geolocalizacion por celda: %s",
-                     esp_err_to_name(geo_err));
-            esp_err_t save_flags_err = geo_cache_set_daily_flags(true, false);
-            if (save_flags_err != ESP_OK) {
-                ESP_LOGW(TAG_APP, "No se pudieron guardar flags geo de fallo: %s",
-                         esp_err_to_name(save_flags_err));
-            }
-            apply_cached_city_or_default(&geo_state, "Fallo de geolocalizacion del dia");
-        }
-    }
+    apply_cached_city_or_default(&geo_state, "Ciudad inicial desde cache");
+    ESP_LOGI(TAG_APP, "Geolocalizacion activa en modo post-envio Hostinger");
 
     vTaskDelay(pdMS_TO_TICKS(1500));
 
