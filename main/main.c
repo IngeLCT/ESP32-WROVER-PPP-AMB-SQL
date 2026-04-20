@@ -29,6 +29,7 @@
 
 static const char *TAG_APP = "app";
 static esp_modem_dce_t *g_dce = NULL;
+static char g_firmware_ver[32] = "0.0.0";
 
 // ---- Ciudad global para el JSON ----
 static char g_city[64]  = "----";
@@ -189,8 +190,6 @@ static void sensor_task(void *pv) {
     int sample_slot = 0;
     uint32_t sum_co2 = 0;
     int scd41_ok_count_5m = 0;
-    int scd41_err03_count_5m = 0;
-    int scd41_zero_count_5m = 0;
 
     int sen55_valid_count_5m = 0;
 
@@ -250,14 +249,6 @@ static void sensor_task(void *pv) {
             scd41_ok_count_5m++;
         }
 
-        if (scd_diag == SENSOR_DIAG_OUT_OF_RANGE) {
-            scd41_err03_count_5m++;
-        }
-
-        if (data.co2 == 0) {
-            scd41_zero_count_5m++;
-        }
-
         // ----------------- SEN55 -----------------
         esp_err_t sen_ret = sensors_read_sen55(&data);
         int sen_diag = sensors_get_last_sen55_diag();
@@ -314,11 +305,8 @@ static void sensor_task(void *pv) {
             }
 
             ESP_LOGI(TAG_APP,
-                     "Resumen 5m | co2=%u scd41_ok=%d scd41_err03=%d scd41_zero=%d sen55_temp_dbg=%.2f sen55_hum_dbg=%.2f",
+                     "Resumen 5m | co2=%u sen55_temp_dbg=%.2f sen55_hum_dbg=%.2f",
                      window_avg.co2,
-                     scd41_ok_count_5m,
-                     scd41_err03_count_5m,
-                     scd41_zero_count_5m,
                      window_avg.sen_temp,
                      window_avg.sen_hum);
 
@@ -334,6 +322,8 @@ static void sensor_task(void *pv) {
             strftime(fecha_actual, sizeof(fecha_actual), "%d-%m-%Y", &tm_info);
 
             char json[896];
+            char json_retry_no_ver[896];
+            bool has_retry_no_ver = false;
 
             bool include_fecha = first_send ||
                                 (strncmp(last_fecha_str, fecha_actual,
@@ -345,26 +335,35 @@ static void sensor_task(void *pv) {
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
                     "\"sen55_temp_dbg\":%.2f,\"sen55_hum_dbg\":%.2f,"
-                    "\"scd41_ok_count_5m\":%d,\"scd41_err03_count_5m\":%d,\"scd41_zero_count_5m\":%d,"
+                    "\"ver\":\"%s\","
                     "\"fecha\":\"%s\",\"inicio\":\"%s\",\"ciudad\":\"%s\",\"hora\":\"%s\","
                     "\"device_id\":\"%s\"}",
                     window_avg.pm1p0, window_avg.pm2p5, window_avg.pm4p0, window_avg.pm10p0,
                     window_avg.voc, window_avg.nox, window_avg.avg_temp, window_avg.avg_hum, window_avg.co2,
                     window_avg.sen_temp, window_avg.sen_hum,
-                    scd41_ok_count_5m, scd41_err03_count_5m, scd41_zero_count_5m,
+                    g_firmware_ver, fecha_actual, inicio_str, g_city, hora_envio, DEVICE_ID);
+
+                snprintf(json_retry_no_ver, sizeof(json_retry_no_ver),
+                    "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
+                    "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
+                    "\"sen55_temp_dbg\":%.2f,\"sen55_hum_dbg\":%.2f,"
+                    "\"fecha\":\"%s\",\"inicio\":\"%s\",\"ciudad\":\"%s\",\"hora\":\"%s\","
+                    "\"device_id\":\"%s\"}",
+                    window_avg.pm1p0, window_avg.pm2p5, window_avg.pm4p0, window_avg.pm10p0,
+                    window_avg.voc, window_avg.nox, window_avg.avg_temp, window_avg.avg_hum, window_avg.co2,
+                    window_avg.sen_temp, window_avg.sen_hum,
                     fecha_actual, inicio_str, g_city, hora_envio, DEVICE_ID);
+                has_retry_no_ver = true;
 
             } else if (include_fecha) {
                 snprintf(json, sizeof(json),
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
                     "\"sen55_temp_dbg\":%.2f,\"sen55_hum_dbg\":%.2f,"
-                    "\"scd41_ok_count_5m\":%d,\"scd41_err03_count_5m\":%d,\"scd41_zero_count_5m\":%d,"
                     "\"fecha\":\"%s\",\"hora\":\"%s\"}",
                     window_avg.pm1p0, window_avg.pm2p5, window_avg.pm4p0, window_avg.pm10p0,
                     window_avg.voc, window_avg.nox, window_avg.avg_temp, window_avg.avg_hum, window_avg.co2,
                     window_avg.sen_temp, window_avg.sen_hum,
-                    scd41_ok_count_5m, scd41_err03_count_5m, scd41_zero_count_5m,
                     fecha_actual, hora_envio);
 
             } else {
@@ -372,12 +371,10 @@ static void sensor_task(void *pv) {
                     "{\"pm1p0\":%.2f,\"pm2p5\":%.2f,\"pm4p0\":%.2f,\"pm10p0\":%.2f,"
                     "\"voc\":%.1f,\"nox\":%.1f,\"cTe\":%.2f,\"cHu\":%.2f,\"co2\":%u,"
                     "\"sen55_temp_dbg\":%.2f,\"sen55_hum_dbg\":%.2f,"
-                    "\"scd41_ok_count_5m\":%d,\"scd41_err03_count_5m\":%d,\"scd41_zero_count_5m\":%d,"
                     "\"hora\":\"%s\"}",
                     window_avg.pm1p0, window_avg.pm2p5, window_avg.pm4p0, window_avg.pm10p0,
                     window_avg.voc, window_avg.nox, window_avg.avg_temp, window_avg.avg_hum, window_avg.co2,
                     window_avg.sen_temp, window_avg.sen_hum,
-                    scd41_ok_count_5m, scd41_err03_count_5m, scd41_zero_count_5m,
                     hora_envio);
             }
 
@@ -388,7 +385,11 @@ static void sensor_task(void *pv) {
             // --- Envío a Hostinger con hasta 3 intentos ---
             int rc = -1;
             for (int attempt = 1; attempt <= HOSTINGER_POST_MAX_RETRIES; ++attempt) {
-                rc = hostinger_ingest_post(json);
+                const char *payload = json;
+                if (first_send && attempt > 1 && has_retry_no_ver) {
+                    payload = json_retry_no_ver;
+                }
+                rc = hostinger_ingest_post(payload);
                 if (rc == 0) {
                     if (attempt > 1) {
                         ESP_LOGW(TAG_APP,
@@ -539,8 +540,6 @@ static void sensor_task(void *pv) {
             sample_slot = 0;
             sum_co2 = 0;
             scd41_ok_count_5m = 0;
-            scd41_err03_count_5m = 0;
-            scd41_zero_count_5m = 0;
             sen55_valid_count_5m = 0;
             sum_pm1p0 = sum_pm2p5 = sum_pm4p0 = sum_pm10p0 = 0;
             sum_voc   = sum_nox   = sum_sen_temp = sum_sen_hum = 0;
@@ -554,9 +553,6 @@ static void sensor_task(void *pv) {
 // ----------------- APP MAIN (PPP + SNTP + GEO + SENSORES) -----------------
 void app_main(void)
 {
-    // esp_log_level_set("esp_modem", ESP_LOG_VERBOSE);
-    // esp_log_level_set("command_lib", ESP_LOG_VERBOSE);
-
     // NVS básico
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -566,6 +562,9 @@ void app_main(void)
     }
 
     const esp_app_desc_t *app_desc = esp_app_get_description();
+    if (app_desc && app_desc->version[0]) {
+        strlcpy(g_firmware_ver, app_desc->version, sizeof(g_firmware_ver));
+    }
     ESP_LOGI(TAG_APP, "Version local firmware: %s", app_desc->version);
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
