@@ -189,7 +189,7 @@ static void sensor_task(void *pv) {
 
     int sample_slot = 0;
     uint32_t sum_co2 = 0;
-    int scd41_ok_count_5m = 0;
+    int scd40_ok_count_5m = 0;
 
     int sen55_valid_count_5m = 0;
 
@@ -240,13 +240,13 @@ static void sensor_task(void *pv) {
 
         SensorData data = {0};
 
-        // ----------------- SCD41 -----------------
-        esp_err_t scd_ret = sensors_read_scd41(&data);
-        int scd_diag = sensors_get_last_scd41_diag();
+        // ----------------- SCD40 -----------------
+        esp_err_t scd_ret = sensors_read_scd40(&data);
+        int scd_diag = sensors_get_last_scd40_diag();
 
         if (scd_ret == ESP_OK) {
             sum_co2 += data.co2;
-            scd41_ok_count_5m++;
+            scd40_ok_count_5m++;
         }
 
         // ----------------- SEN55 -----------------
@@ -269,7 +269,7 @@ static void sensor_task(void *pv) {
 
     #if LOG_EACH_SAMPLE
         ESP_LOGI(TAG_APP,
-            "Muestra %d/%d de 5m | SCD41: co2_raw=%u diag=%02d ret=%s | SEN55: diag=%02d ret=%s",
+            "Muestra %d/%d de 5m | SCD40: co2_raw=%u diag=%02d ret=%s | SEN55: diag=%02d ret=%s",
             sample_slot + 1,
             SAMPLES_PER_SEND_WINDOW,
             data.co2,
@@ -284,8 +284,8 @@ static void sensor_task(void *pv) {
         if (sample_slot >= SAMPLES_PER_SEND_WINDOW) {
             SensorData window_avg = (SensorData){0};
 
-            if (scd41_ok_count_5m > 0) {
-                window_avg.co2 = (uint16_t)(sum_co2 / scd41_ok_count_5m);
+            if (scd40_ok_count_5m > 0) {
+                window_avg.co2 = (uint16_t)(sum_co2 / scd40_ok_count_5m);
             }
 
             if (sen55_valid_count_5m > 0) {
@@ -539,7 +539,7 @@ static void sensor_task(void *pv) {
 
             sample_slot = 0;
             sum_co2 = 0;
-            scd41_ok_count_5m = 0;
+            scd40_ok_count_5m = 0;
             sen55_valid_count_5m = 0;
             sum_pm1p0 = sum_pm2p5 = sum_pm4p0 = sum_pm10p0 = 0;
             sum_voc   = sum_nox   = sum_sen_temp = sum_sen_hum = 0;
